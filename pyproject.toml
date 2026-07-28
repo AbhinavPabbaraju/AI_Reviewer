@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "argus"
+version = "0.1.0"
+description = "An AI pull-request reviewer optimized for precision, not coverage."
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.6",
+    "pathspec>=0.12",
+    "tree-sitter>=0.23",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-typescript>=0.23",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.9",
+    "ruff>=0.4",
+]
+
+# `app` (domain/infra/api) and `worker` (pipeline/tasks) are two top-level
+# packages living under separate service roots, installed as one distribution.
+# ADR-005: the worker shares `app.domain` as an installed local package.
+[tool.setuptools.packages.find]
+where = ["services/api", "services/worker"]
+include = ["app*", "worker*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["services/api", "services/worker"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["services/api", "services/worker", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PTH", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+# The domain is the contract spine and is held to strict typing (M0/M1 exit
+# criteria). Infra adapters wrap untyped third-party libraries (tree-sitter),
+# so a couple of pragmatic escape hatches are configured per-module below.
+mypy_path = "services/api:services/worker"
+packages = ["app", "worker"]
+
+[[tool.mypy.overrides]]
+module = ["tree_sitter_python.*", "tree_sitter_typescript.*"]
+ignore_missing_imports = true
