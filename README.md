@@ -262,3 +262,7 @@ to three. "Why we didn't build it" is the part of a design doc that actually get
 [`CLAUDE.md`](CLAUDE.md) holds the working norms: the invariants that must not be broken,
 how the measured gates work, and where the layering boundaries are. The short version — when
 making a change, ask "does this protect precision?" before "does this find more bugs?"
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).

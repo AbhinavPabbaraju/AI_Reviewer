@@ -6,6 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "argus"
 version = "0.1.0"
 description = "An AI pull-request reviewer optimized for precision, not coverage."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Abhinav Pabbaraju" }]
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.6",
