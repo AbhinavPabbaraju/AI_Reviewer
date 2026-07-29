@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 import tree_sitter as ts
 
 from app.domain.indexing.models import (
+    STAR_IMPORT,
     EdgeKind,
     Import,
     Language,
@@ -80,6 +81,8 @@ class _Extractor:
     symbols: list[Symbol] = field(default_factory=list)
     imports: list[Import] = field(default_factory=list)
     references: list[Reference] = field(default_factory=list)
+    scopes: list[dict[str, str]] = field(default_factory=list)
+    """Stack of ``local name -> constructor name`` maps, innermost last."""
 
     # -- traversal ------------------------------------------------------- #
 
@@ -94,7 +97,9 @@ class _Extractor:
                 is_exported=True,
             )
         )
+        self.scopes.append(_local_constructors(root, self.source))
         self._visit(root, self.module_fqn, [], in_class=False)
+        self.scopes.pop()
 
     def _visit(
         self, node: ts.Node, enclosing_fqn: str, name_stack: list[str], *, in_class: bool
@@ -174,7 +179,9 @@ class _Extractor:
             )
 
         if body is not None:
+            self.scopes.append(_local_constructors(body, self.source))
             self._visit(body, fqn, [*name_stack, name], in_class=is_class)
+            self.scopes.pop()
 
     # -- imports --------------------------------------------------------- #
 
@@ -219,7 +226,7 @@ class _Extractor:
         if not name_nodes:  # `from x import *`
             self.imports.append(
                 Import(
-                    local_name=base_module or "*",
+                    local_name=STAR_IMPORT,
                     module=base_module,
                     imported_symbol=None,
                     is_relative=is_relative,
@@ -337,8 +344,20 @@ class _Extractor:
                 from_fqn=enclosing_fqn,
                 line=call_node.start_point[0] + 1,
                 receiver=receiver,
+                receiver_type=self._local_type(receiver),
             )
         )
+
+    def _local_type(self, receiver: str | None) -> str | None:
+        """The constructor a plain-name receiver was assigned from, innermost
+        scope first. Dotted receivers are attribute chains, not locals."""
+        if receiver is None or "." in receiver:
+            return None
+        for scope in reversed(self.scopes):
+            found = scope.get(receiver)
+            if found is not None:
+                return found
+        return None
 
     # -- shared node helpers --------------------------------------------- #
 
@@ -382,6 +401,54 @@ class _Extractor:
         for child in node.named_children:
             results.extend(self._type_names(child))
         return results
+
+
+_NESTED_DEFINITIONS = frozenset(
+    {"function_definition", "class_definition", "decorated_definition"}
+)
+
+
+def _local_constructors(body: ts.Node, source: bytes) -> dict[str, str]:
+    """``{local name: callee name}`` for every ``x = Something(...)`` directly in
+    this scope.
+
+    The callee is recorded as written, with no attempt to decide whether it is a
+    class -- the resolver makes that call, because only it has the symbol table.
+    A parser that guessed "capitalized means class" would be inventing type
+    information, and mis-typed receivers produce exactly the confident-but-wrong
+    edges the graph must not contain.
+
+    Nested ``def``/``class`` bodies are not descended into: they get their own
+    scope, pushed when the extractor reaches them.
+    """
+    found: dict[str, str] = {}
+    stack = list(body.named_children)
+    while stack:
+        node = stack.pop()
+        if node.type in _NESTED_DEFINITIONS:
+            continue
+        if node.type == "assignment":
+            binding = _constructor_binding(node, source)
+            if binding is not None:
+                found[binding[0]] = binding[1]
+            continue
+        stack.extend(node.named_children)
+    return found
+
+
+def _constructor_binding(
+    assignment: ts.Node, source: bytes
+) -> tuple[str, str] | None:
+    left = assignment.child_by_field_name("left")
+    right = assignment.child_by_field_name("right")
+    if left is None or right is None or left.type != "identifier":
+        return None
+    if right.type != "call":
+        return None
+    callee = right.child_by_field_name("function")
+    if callee is None or callee.type != "identifier":
+        return None
+    return node_text(left, source), node_text(callee, source)
 
 
 def _signature(node: ts.Node, body: ts.Node | None, source: bytes) -> str:

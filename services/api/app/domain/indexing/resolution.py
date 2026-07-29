@@ -28,6 +28,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from app.domain.indexing.models import (
+    STAR_IMPORT,
     EdgeKind,
     Import,
     Language,
@@ -43,6 +44,8 @@ __all__ = ["ResolutionResult", "ResolutionStats", "Resolver"]
 
 _SELF_RECEIVERS: frozenset[str] = frozenset({"self", "this", "cls"})
 _MAX_INHERITANCE_DEPTH = 5
+_MAX_REEXPORT_DEPTH = 5
+_PACKAGE_INIT = "__init__.py"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,12 +59,18 @@ class _Resolved:
 
 @dataclass(slots=True)
 class _Scope:
-    """A module's resolution context: its imports and where it lives on disk."""
+    """A module's resolution context: its imports and where it lives on disk.
+
+    Wildcard bindings are kept in a separate list rather than the by-local-name
+    map: they all share the local name ``*``, so a barrel with two
+    ``export * from`` lines would otherwise keep only the last one.
+    """
 
     module_fqn: str
     language: Language
     path: str
     imports: dict[str, Import] = field(default_factory=dict)
+    stars: tuple[Import, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +126,14 @@ class Resolver:
                 module_fqn=parsed.module_fqn,
                 language=parsed.file.language,
                 path=parsed.file.path,
-                imports={imp.local_name: imp for imp in parsed.imports},
+                imports={
+                    imp.local_name: imp
+                    for imp in parsed.imports
+                    if imp.local_name != STAR_IMPORT
+                },
+                stars=tuple(
+                    imp for imp in parsed.imports if imp.local_name == STAR_IMPORT
+                ),
             )
             for symbol in parsed.symbols:
                 self._index_symbol(parsed.module_fqn, symbol)
@@ -179,7 +195,9 @@ class Resolver:
             EdgeKind.IMPORTS, module_fqn, self._resolve_binding(scope, imp)
         )
 
-    def _resolve_binding(self, scope: _Scope, imp: Import) -> _Resolved:
+    def _resolve_binding(
+        self, scope: _Scope, imp: Import, _depth: int = 0
+    ) -> _Resolved:
         """Resolve an import binding to a repo symbol, a repo *submodule*, or an
         external target. Shared by import-edge creation and by bare-name
         resolution, so `from . import util` and a later bare `util.x` agree."""
@@ -199,8 +217,56 @@ class Resolver:
             if submodule in self._modules:
                 return _Resolved(submodule, None, confidence.EXACT)
             if base in self._modules:
+                # The module exists but does not define the name: it is almost
+                # always re-exporting it (a package `__init__` or a TS barrel).
+                # Follow the chain rather than declaring a repo-internal import
+                # unresolved -- barrels are how real code is imported.
+                reexport = self._follow_reexport(base, imp.imported_symbol, _depth)
+                if reexport is not None:
+                    return reexport
                 return _Resolved(None, imp.target_name, confidence.UNRESOLVED)
         return _Resolved(None, imp.target_name, confidence.EXTERNAL)
+
+    def _follow_reexport(
+        self, module_fqn: str, name: str, _depth: int
+    ) -> _Resolved | None:
+        """Resolve ``name`` through ``module_fqn``'s own imports (one hop of a
+        re-export chain), or None if it does not re-export that name.
+
+        Depth-capped: a cyclic barrel (``a`` re-exports from ``b``, ``b`` from
+        ``a``) must terminate rather than recurse forever.
+        """
+        if _depth >= _MAX_REEXPORT_DEPTH:
+            return None
+        via = self._scopes.get(module_fqn)
+        if via is None:
+            return None
+        imp = via.imports.get(name)
+        if imp is not None:
+            resolved = self._resolve_binding(via, imp, _depth + 1)
+            if resolved.dst_fqn is not None:
+                return resolved
+        return self._follow_wildcard(via, name, _depth)
+
+    def _follow_wildcard(
+        self, via: _Scope, name: str, _depth: int
+    ) -> _Resolved | None:
+        """Search the modules a wildcard binding pulls in (``export * from``,
+        ``from m import *``) for ``name``. Only wildcards are searched: a named
+        binding says exactly which name it carries, and rummaging through
+        unrelated imported modules for a name they were never asked for is how a
+        resolver starts inventing edges."""
+        for star in via.stars:
+            target = self._resolve_module(via, star)
+            if target is None:
+                continue
+            symbol = self._top_level.get(target, {}).get(name)
+            if symbol is not None:
+                return _Resolved(symbol.fqn, None, confidence.EXACT)
+            chained = self._follow_reexport(target, name, _depth + 1)
+            if chained is not None:
+                return chained
+        return None
 
     # -- reference resolution -------------------------------------------- #
 
@@ -217,6 +283,9 @@ class Resolver:
             return self._heuristic(name, prefer_methods=True)
 
         if receiver is not None:
+            typed = self._resolve_typed_receiver(scope, ref.receiver_type, name)
+            if typed is not None:
+                return typed
             module = self._imported_module(scope, receiver)
             if module is not None:
                 symbol = self._top_level.get(module, {}).get(name)
@@ -225,9 +294,55 @@ class Resolver:
                 return _Resolved(None, f"{module}.{name}", confidence.UNRESOLVED)
             if self._is_external_receiver(scope, receiver):
                 return _Resolved(None, f"{receiver}.{name}", confidence.EXTERNAL)
-            return self._heuristic(name, prefer_methods=True)
+            return self._heuristic(
+                name,
+                prefer_methods=True,
+                exclude_members_of=self._self_attribute_owner(ref, receiver),
+            )
 
         return self._resolve_bare(scope, name)
+
+    def _resolve_typed_receiver(
+        self, scope: _Scope, type_name: str | None, member: str
+    ) -> _Resolved | None:
+        """Resolve ``member`` against the class a local receiver was constructed
+        from, or None if that is not what the receiver is.
+
+        This is where the parser's ``receiver_type`` hint is *validated*: the
+        name must resolve, it must resolve to a class in this repository, and
+        that class (or a base) must actually declare the member. Any of those
+        failing falls through to the ordinary name heuristics, so a hint that
+        names a factory function or an external type costs nothing.
+        """
+        if type_name is None:
+            return None
+        candidate = self._resolve_bare(scope, type_name)
+        if candidate.dst_fqn is None:
+            return None
+        symbol = self._by_fqn.get(candidate.dst_fqn)
+        if symbol is None or symbol.kind is not SymbolKind.CLASS:
+            return None
+        found = self._lookup_member(symbol.fqn, member)
+        if found is None:
+            return None
+        return _Resolved(found.fqn, None, confidence.INFERRED_LOCAL)
+
+    def _self_attribute_owner(self, ref: Reference, receiver: str) -> str | None:
+        """For a call through an *attribute of self* (``self._conn.execute()``),
+        the class whose own members must be excluded from name matching.
+
+        The receiver is a collaborator held by the enclosing instance, so it is
+        emphatically not the enclosing instance. Without this, a method that
+        happens to share a name with the collaborator's -- ``self._conn.close()``
+        inside ``close()`` -- resolves to itself, and the graph grows a
+        confident, entirely fabricated self-edge. Fabrication is the failure
+        mode this project exists to prevent, so the ambiguity is preserved
+        instead (ARCHITECTURE sec. 4.2).
+        """
+        root, _, rest = receiver.partition(".")
+        if not rest or root not in _SELF_RECEIVERS:
+            return None
+        return self._enclosing_class(ref.from_fqn)
 
     def _resolve_bare(self, scope: _Scope, name: str) -> _Resolved:
         imp = scope.imports.get(name)
@@ -250,8 +365,16 @@ class Resolver:
             return _Resolved(bare.dst_fqn, None, confidence.TEST_HEURISTIC)
         return _Resolved(None, candidate, confidence.UNRESOLVED)
 
-    def _heuristic(self, name: str, *, prefer_methods: bool) -> _Resolved:
+    def _heuristic(
+        self,
+        name: str,
+        *,
+        prefer_methods: bool,
+        exclude_members_of: str | None = None,
+    ) -> _Resolved:
         candidates = self._by_name.get(name, [])
+        if exclude_members_of is not None:
+            candidates = [s for s in candidates if s.parent_fqn != exclude_members_of]
         if prefer_methods:
             methods = [s for s in candidates if s.kind is SymbolKind.METHOD]
             candidates = methods or candidates
@@ -297,19 +420,27 @@ class Resolver:
         return None
 
     def _is_external_receiver(self, scope: _Scope, receiver: str) -> bool:
-        imp = scope.imports.get(receiver)
-        return (
-            imp is not None
-            and imp.imported_symbol is None
-            and self._resolve_module(scope, imp) is None
-        )
+        """True when the receiver chain is *rooted* at an external module.
+
+        The root matters, not just the whole chain: ``os.environ.get()`` has
+        receiver ``os.environ``, which is bound to nothing, but its root ``os``
+        is an external import -- so the call leaves the repository and must not
+        be name-matched against repo symbols (there is a ``get`` in every
+        repository class).
+        """
+        root = receiver.partition(".")[0]
+        for candidate in (receiver, root):
+            imp = scope.imports.get(candidate)
+            if imp is not None and imp.imported_symbol is None:
+                return self._resolve_module(scope, imp) is None
+        return False
 
     def _resolve_module(self, scope: _Scope, imp: Import) -> str | None:
         """Map an import's module specifier to an internal module fqn, or None if
         it points outside the repository. The one language-specific step."""
         if scope.language is Language.PYTHON:
             if imp.is_relative:
-                package = self._python_package(scope.module_fqn, imp.level)
+                package = self._python_package(scope, imp.level)
                 if package is None:
                     return None
                 module = f"{package}.{imp.module}" if imp.module else package
@@ -329,7 +460,7 @@ class Resolver:
         yields the package path used to look ``submodule`` up as a module."""
         if scope.language is Language.PYTHON:
             if imp.is_relative:
-                package = self._python_package(scope.module_fqn, imp.level)
+                package = self._python_package(scope, imp.level)
                 if package is None:
                     return None
                 return f"{package}.{imp.module}" if imp.module else package
@@ -339,11 +470,21 @@ class Resolver:
         return None
 
     @staticmethod
-    def _python_package(module_fqn: str, level: int) -> str | None:
-        parts = module_fqn.split(".")
-        if level > len(parts):
+    def _python_package(scope: _Scope, level: int) -> str | None:
+        """The package a relative import of ``level`` dots resolves against.
+
+        A module's own name is not part of its package, but a package's
+        ``__init__.py`` *is* the package (``__package__`` is the package itself,
+        not its parent), so one leading dot there means "this package". Getting
+        this wrong makes every re-export in every ``__init__.py`` resolve to a
+        phantom external module -- and package inits are where real projects put
+        their public API.
+        """
+        parts = scope.module_fqn.split(".")
+        strip = level - 1 if scope.path.endswith(_PACKAGE_INIT) else level
+        if strip > len(parts):
             return None
-        base = parts[: len(parts) - level]
+        base = parts[: len(parts) - strip] if strip else parts
         return ".".join(base) if base else None
 
     def _ts_resolve_relative(self, importer_path: str, spec: str) -> str | None:

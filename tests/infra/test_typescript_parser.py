@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.domain.indexing.models import EdgeKind, SymbolKind
+from app.domain.indexing.models import STAR_IMPORT, EdgeKind, SymbolKind
 from app.infra.parsing.typescript import module_id_for_path
 from tests.conftest import parse_typescript
 
@@ -88,6 +88,39 @@ class TestImports:
         pf = parse_typescript("src/x.ts", 'import "./styles.css";\n')
         assert pf.imports[0].module == "./styles.css"
         assert pf.imports[0].imported_symbol is None
+
+
+class TestReExports:
+    """`export ... from` is a binding brought into this module and re-exposed,
+    so it is emitted as an import -- which is what makes a barrel `index.ts`
+    followable by the (language-agnostic) resolver."""
+
+    def test_named_reexport_becomes_an_import(self) -> None:
+        pf = parse_typescript("src/index.ts", 'export { A, B as C } from "./a";\n')
+        imports = {imp.local_name: imp for imp in pf.imports}
+        assert imports["A"].imported_symbol == "A"
+        assert imports["A"].module == "./a"
+        assert imports["A"].is_relative
+        assert imports["C"].imported_symbol == "B"  # renamed on the way out
+
+    def test_typed_reexport_is_captured(self) -> None:
+        pf = parse_typescript("src/index.ts", 'export type { Repo } from "./base";\n')
+        assert pf.imports[0].imported_symbol == "Repo"
+
+    def test_wildcard_reexport_is_marked_as_a_star(self) -> None:
+        pf = parse_typescript("src/index.ts", 'export * from "./a";\nexport * from "./b";\n')
+        assert [imp.local_name for imp in pf.imports] == [STAR_IMPORT, STAR_IMPORT]
+        assert {imp.module for imp in pf.imports} == {"./a", "./b"}
+
+    def test_namespace_reexport_keeps_its_alias(self) -> None:
+        pf = parse_typescript("src/index.ts", 'export * as helpers from "./a";\n')
+        assert pf.imports[0].local_name == "helpers"
+        assert pf.imports[0].imported_symbol is None
+
+    def test_local_export_list_is_not_an_import(self) -> None:
+        # `export { D };` re-exports something defined *here*: no module to bind.
+        pf = parse_typescript("src/index.ts", "const D = () => 1;\nexport { D };\n")
+        assert pf.imports == ()
 
 
 class TestReferences:

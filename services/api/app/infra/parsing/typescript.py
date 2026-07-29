@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 import tree_sitter as ts
 
 from app.domain.indexing.models import (
+    STAR_IMPORT,
     EdgeKind,
     Import,
     Language,
@@ -101,6 +102,8 @@ class _Extractor:
     symbols: list[Symbol] = field(default_factory=list)
     imports: list[Import] = field(default_factory=list)
     references: list[Reference] = field(default_factory=list)
+    scopes: list[dict[str, str]] = field(default_factory=list)
+    """Stack of ``local name -> constructed class name`` maps, innermost last."""
 
     # -- fqn helpers ----------------------------------------------------- #
 
@@ -122,12 +125,18 @@ class _Extractor:
                 language=Language.TYPESCRIPT,
             )
         )
+        self.scopes.append(_local_constructors(root, self.source))
         for child in root.named_children:
             self._handle(child, [], exported=False)
+        self.scopes.pop()
 
     def _handle(self, node: ts.Node, name_stack: list[str], *, exported: bool) -> None:
         kind = node.type
         if kind == "export_statement":
+            source = node.child_by_field_name("source")
+            if source is not None:
+                self._emit_reexport(node, source)
+                return
             decl = node.child_by_field_name("declaration")
             if decl is not None:
                 self._handle(decl, name_stack, exported=True)
@@ -251,7 +260,9 @@ class _Extractor:
         )
         self._emit_annotation_refs(node, fqn)
         if body is not None:
+            self.scopes.append(_local_constructors(body, self.source))
             self._collect_calls(body, fqn)
+            self.scopes.pop()
 
     def _emit_variables(
         self, node: ts.Node, name_stack: list[str], *, exported: bool
@@ -282,7 +293,9 @@ class _Extractor:
             self._emit_annotation_refs(value, fqn)
             body = value.child_by_field_name("body")
             if body is not None:
+                self.scopes.append(_local_constructors(body, self.source))
                 self._collect_calls(body, fqn)
+                self.scopes.pop()
 
     # -- imports --------------------------------------------------------- #
 
@@ -343,6 +356,56 @@ class _Extractor:
                         line=line,
                     )
                 )
+
+    def _emit_reexport(self, node: ts.Node, source_node: ts.Node) -> None:
+        """``export { X } from "./m"`` / ``export * from "./m"``.
+
+        Modeled as *imports*, because that is what they are: the name is bound
+        into this module's namespace (and re-exposed from it). Emitting them as
+        imports means the resolver's re-export following works on TS barrels
+        with no TS-specific code -- and a barrel ``index.ts`` is how most
+        TypeScript code is imported, so dropping these statements (as the parser
+        previously did) silently disconnected whole packages from the graph.
+        """
+        module = _string_value(node_text(source_node, self.source))
+        is_relative = module.startswith(".")
+        line = node.start_point[0] + 1
+        clause = _first_child_of_type(node, "export_clause")
+        if clause is not None:
+            for spec in clause.named_children:
+                if spec.type != "export_specifier":
+                    continue
+                name_node = spec.child_by_field_name("name")
+                if name_node is None:
+                    continue
+                name = node_text(name_node, self.source)
+                alias_node = spec.child_by_field_name("alias")
+                local = node_text(alias_node, self.source) if alias_node else name
+                self.imports.append(
+                    Import(
+                        local_name=local,
+                        module=module,
+                        imported_symbol=name,
+                        is_relative=is_relative,
+                        line=line,
+                    )
+                )
+            return
+        namespace = _first_child_of_type(node, "namespace_export")
+        local = (
+            node_text(namespace.named_children[-1], self.source)
+            if namespace is not None and namespace.named_children
+            else STAR_IMPORT
+        )
+        self.imports.append(
+            Import(
+                local_name=local,
+                module=module,
+                imported_symbol=None,
+                is_relative=is_relative,
+                line=line,
+            )
+        )
 
     # -- references ------------------------------------------------------ #
 
@@ -413,8 +476,20 @@ class _Extractor:
                 from_fqn=enclosing_fqn,
                 line=call_node.start_point[0] + 1,
                 receiver=receiver,
+                receiver_type=self._local_type(receiver),
             )
         )
+
+    def _local_type(self, receiver: str | None) -> str | None:
+        """The class a plain-name receiver was constructed from, innermost scope
+        first. Dotted receivers are member chains, not locals."""
+        if receiver is None or "." in receiver:
+            return None
+        for scope in reversed(self.scopes):
+            found = scope.get(receiver)
+            if found is not None:
+                return found
+        return None
 
     def _dotted(self, node: ts.Node) -> tuple[str | None, str | None]:
         if node.type in ("identifier", "type_identifier", "property_identifier"):
@@ -455,6 +530,46 @@ class _Extractor:
     def _first_line(self, node: ts.Node) -> str:
         text = node_text(node, self.source).split("\n", 1)[0].strip()
         return _WHITESPACE.sub(" ", text).rstrip("{").strip()
+
+
+def _local_constructors(body: ts.Node, source: bytes) -> dict[str, str]:
+    """``{local name: class name}`` for every ``const x = new Thing(...)``
+    directly in this scope.
+
+    TypeScript states construction explicitly with ``new``, so unlike Python
+    there is no ambiguity about whether the right-hand side is a constructor
+    call -- but the class name is still only *recorded* here. The resolver
+    decides whether it names a class in this repository (see
+    ``confidence.INFERRED_LOCAL``).
+    """
+    found: dict[str, str] = {}
+    stack = list(body.named_children)
+    while stack:
+        node = stack.pop()
+        if node.type in _SYMBOL_BOUNDARIES:
+            continue
+        if node.type == "variable_declarator":
+            binding = _constructor_binding(node, source)
+            if binding is not None:
+                found[binding[0]] = binding[1]
+            continue
+        stack.extend(node.named_children)
+    return found
+
+
+def _constructor_binding(
+    declarator: ts.Node, source: bytes
+) -> tuple[str, str] | None:
+    name_node = declarator.child_by_field_name("name")
+    value = declarator.child_by_field_name("value")
+    if name_node is None or value is None or name_node.type != "identifier":
+        return None
+    if value.type != "new_expression":
+        return None
+    constructor = value.child_by_field_name("constructor")
+    if constructor is None or constructor.type != "identifier":
+        return None
+    return node_text(name_node, source), node_text(constructor, source)
 
 
 def _string_value(raw: str) -> str:

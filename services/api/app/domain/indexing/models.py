@@ -25,6 +25,7 @@ from app.domain.base import Frozen
 from app.domain.contracts import CodeSpan
 
 __all__ = [
+    "STAR_IMPORT",
     "Chunk",
     "EdgeKind",
     "Import",
@@ -38,6 +39,14 @@ __all__ = [
     "SymbolKind",
     "confidence",
 ]
+
+
+STAR_IMPORT: Final = "*"
+"""``local_name`` marking a wildcard binding (``from m import *``, ``export *
+from "./m"``). It cannot collide with a real identifier in either language, so
+the resolver can tell "every name in that module" apart from a named binding --
+which matters, because following a wildcard means searching another module's
+symbols, and doing that for a *named* binding would invent edges."""
 
 
 class Language(StrEnum):
@@ -122,6 +131,12 @@ class confidence:
     EXTERNAL: Final = 0.9
     """An import that resolves to a module outside the repo (stdlib / vendor).
     High confidence that it is *external*, which is itself useful signal."""
+
+    INFERRED_LOCAL: Final = 0.9
+    """Resolved through a local variable's constructed type (``repo =
+    MemoryRepository()`` ... ``repo.put(x)``). Just short of EXACT because the
+    binding is a *last write wins* approximation: a variable reassigned on a
+    later branch is still attributed to the constructor the parser saw."""
 
     UNRESOLVED: Final = 0.3
     """Kept for graph completeness but not resolved to any symbol."""
@@ -230,6 +245,13 @@ class Reference(Frozen):
         default=None,
         description="Receiver text for an attribute access: 'self', a module "
         "alias, or a variable name. None for a bare name.",
+    )
+    receiver_type: str | None = Field(
+        default=None,
+        description="Type name the receiver was constructed from in the same "
+        "scope (`repo = MemoryRepository()`), when the parser could see it. A "
+        "textual name like any other target: the resolver still has to resolve "
+        "it, and ignores it unless it lands on a class in this repository.",
     )
 
 

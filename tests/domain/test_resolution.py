@@ -170,6 +170,233 @@ class TestTypeScriptResolution:
         assert imp.confidence == confidence.EXTERNAL
 
 
+class TestPackageAndReExportResolution:
+    """Re-exports: how real code is imported, and where a naive resolver quits.
+
+    A package `__init__` (or a TS barrel) defines almost nothing itself; it
+    re-exposes names from its submodules. Treating those imports as unresolved
+    disconnects the package's entire public surface from the graph.
+    """
+
+    def test_relative_import_inside_package_init_resolves(self) -> None:
+        # In `pkg/__init__.py`, one dot means *this* package, not its parent.
+        config = "class Settings:\n    pass\n"
+        init = "from .config import Settings\n"
+        edges = _edges(
+            parse_python("pkg/config.py", config),
+            parse_python("pkg/__init__.py", init),
+        )
+        imp = _find(edges, EdgeKind.IMPORTS, "pkg")
+        assert imp.dst_fqn == "pkg.config.Settings"
+        assert imp.confidence == confidence.EXACT
+
+    def test_import_through_package_reexport_resolves_to_definition(self) -> None:
+        base = "class Repository:\n    pass\n"
+        init = "from .base import Repository\n"
+        user = (
+            "from pkg import Repository\n"
+            "def build():\n"
+            "    return Repository()\n"
+        )
+        edges = _edges(
+            parse_python("pkg/base.py", base),
+            parse_python("pkg/__init__.py", init),
+            parse_python("app/user.py", user),
+        )
+        imp = _find(edges, EdgeKind.IMPORTS, "app.user")
+        assert imp.dst_fqn == "pkg.base.Repository"
+        call = _find(edges, EdgeKind.CALLS, "app.user.build")
+        assert call.dst_fqn == "pkg.base.Repository"
+
+    def test_star_reexport_is_followed(self) -> None:
+        text = "def slugify(v):\n    return v\n"
+        init = "from .text import *\n"
+        user = "from pkg import slugify\ndef run():\n    return slugify('x')\n"
+        edges = _edges(
+            parse_python("pkg/text.py", text),
+            parse_python("pkg/__init__.py", init),
+            parse_python("app/user.py", user),
+        )
+        assert _find(edges, EdgeKind.IMPORTS, "app.user").dst_fqn == "pkg.text.slugify"
+
+    def test_typescript_barrel_reexport_resolves(self) -> None:
+        base = "export class Repository {\n  get(): void {}\n}\n"
+        barrel = 'export { Repository } from "./base";\n'
+        user = (
+            'import { Repository } from "../store";\n'
+            "export function build(): Repository {\n"
+            "  return new Repository();\n"
+            "}\n"
+        )
+        edges = _edges(
+            parse_typescript("src/store/base.ts", base),
+            parse_typescript("src/store/index.ts", barrel),
+            parse_typescript("src/app/user.ts", user),
+        )
+        imp = _find(edges, EdgeKind.IMPORTS, "src/app/user")
+        assert imp.dst_fqn == "src/store/base::Repository"
+
+    def test_typescript_barrel_keeps_every_wildcard(self) -> None:
+        # Two `export *` lines share the local name `*`; a map keyed by local
+        # name would silently keep only the last one.
+        text = "export function slugify(v: string): string {\n  return v;\n}\n"
+        timing = "export function now(): number {\n  return 0;\n}\n"
+        barrel = 'export * from "./text";\nexport * from "./timing";\n'
+        user = (
+            'import { slugify, now } from "../util";\n'
+            "export function run(): void {\n"
+            "  slugify(`${now()}`);\n"
+            "}\n"
+        )
+        edges = _edges(
+            parse_typescript("src/util/text.ts", text),
+            parse_typescript("src/util/timing.ts", timing),
+            parse_typescript("src/util/index.ts", barrel),
+            parse_typescript("src/app/user.ts", user),
+        )
+        targets = {
+            e.dst_fqn
+            for e in edges
+            if e.kind is EdgeKind.IMPORTS and e.src_fqn == "src/app/user"
+        }
+        assert targets == {"src/util/text::slugify", "src/util/timing::now"}
+
+
+class TestReceiverResolutionDoesNotFabricate:
+    """Precision guards: cases where the honest answer is "I don't know"."""
+
+    def test_call_through_external_module_attribute_stays_external(self) -> None:
+        # `os.environ.get()` must not match the `get` of some repository class.
+        store = "class Store:\n    def get(self, k):\n        return k\n"
+        main = "import os\ndef run():\n    return os.environ.get('X')\n"
+        edges = _edges(
+            parse_python("app/store.py", store), parse_python("app/main.py", main)
+        )
+        edge = _find(edges, EdgeKind.CALLS, "app.main.run")
+        assert not edge.is_resolved
+        assert edge.dst_unresolved_name == "os.environ.get"
+        assert edge.confidence == confidence.EXTERNAL
+
+    def test_self_attribute_call_does_not_bind_to_the_enclosing_class(self) -> None:
+        # `self._conn.close()` inside `close()` is a *different* object's method.
+        src = (
+            "import sqlite3\n"
+            "class Store:\n"
+            "    def __init__(self, dsn):\n"
+            "        self._conn = sqlite3.connect(dsn)\n"
+            "    def close(self):\n"
+            "        return self._conn.close()\n"
+        )
+        edges = _edges(parse_python("app/store.py", src))
+        edge = _find(edges, EdgeKind.CALLS, "app.store.Store.close")
+        assert not edge.is_resolved
+        assert edge.dst_unresolved_name == "close"
+
+    def test_self_attribute_call_still_reaches_a_collaborator(self) -> None:
+        # Excluding the enclosing class must not blind the resolver entirely:
+        # the collaborator's method is a different class and still resolves.
+        repo = "class Repo:\n    def put(self, x):\n        return x\n"
+        service = (
+            "from app.repo import Repo\n"
+            "class Service:\n"
+            "    def __init__(self, repo):\n"
+            "        self._repo = repo\n"
+            "    def save(self, x):\n"
+            "        return self._repo.put(x)\n"
+        )
+        edges = _edges(
+            parse_python("app/repo.py", repo), parse_python("app/service.py", service)
+        )
+        edge = _find(edges, EdgeKind.CALLS, "app.service.Service.save")
+        assert edge.dst_fqn == "app.repo.Repo.put"
+
+
+class TestLocalConstructorInference:
+    """`x = Concrete()` then `x.m()` resolves to `Concrete.m`, not to whichever
+    same-named method sorts first."""
+
+    def test_python_local_construction_selects_the_concrete_class(self) -> None:
+        base = "class Base:\n    def put(self, x):\n        return x\n"
+        memory = (
+            "from app.base import Base\n"
+            "class Memory(Base):\n"
+            "    def put(self, x):\n"
+            "        return x\n"
+        )
+        test = (
+            "from app.memory import Memory\n"
+            "def run():\n"
+            "    repo = Memory()\n"
+            "    return repo.put(1)\n"
+        )
+        edges = _edges(
+            parse_python("app/base.py", base),
+            parse_python("app/memory.py", memory),
+            parse_python("app/run.py", test),
+        )
+        edge = _find(edges, EdgeKind.CALLS, "app.run.run", dst="app.memory.Memory.put")
+        assert edge.confidence == confidence.INFERRED_LOCAL
+
+    def test_python_inherited_member_is_found_through_the_local_type(self) -> None:
+        base = "class Base:\n    def flush(self):\n        return 1\n"
+        memory = "from app.base import Base\nclass Memory(Base):\n    pass\n"
+        run = (
+            "from app.memory import Memory\n"
+            "def run():\n"
+            "    repo = Memory()\n"
+            "    return repo.flush()\n"
+        )
+        edges = _edges(
+            parse_python("app/base.py", base),
+            parse_python("app/memory.py", memory),
+            parse_python("app/run.py", run),
+        )
+        edge = _find(edges, EdgeKind.CALLS, "app.run.run", dst="app.base.Base.flush")
+        assert edge.confidence == confidence.INFERRED_LOCAL
+
+    def test_factory_function_hint_is_ignored(self) -> None:
+        # `service = make_service()` names a function, not a class: the hint
+        # must be discarded rather than used to invent a type.
+        module = (
+            "class Service:\n"
+            "    def run(self):\n"
+            "        return 1\n"
+            "def make_service():\n"
+            "    return Service()\n"
+            "def main():\n"
+            "    service = make_service()\n"
+            "    return service.run()\n"
+        )
+        edges = _edges(parse_python("app/m.py", module))
+        edge = _find(edges, EdgeKind.CALLS, "app.m.main", dst="app.m.Service.run")
+        assert edge.confidence == confidence.HEURISTIC_UNIQUE
+
+    def test_typescript_local_construction_selects_the_concrete_class(self) -> None:
+        base = "export class Base {\n  put(x: number): void {}\n}\n"
+        memory = (
+            'import { Base } from "./base";\n'
+            "export class Memory extends Base {\n"
+            "  put(x: number): void {}\n"
+            "}\n"
+        )
+        test = (
+            'import { Memory } from "../src/memory";\n'
+            "export function run(): void {\n"
+            "  const repo = new Memory();\n"
+            "  repo.put(1);\n"
+            "}\n"
+        )
+        edges = _edges(
+            parse_typescript("src/base.ts", base),
+            parse_typescript("src/memory.ts", memory),
+            parse_typescript("tests/run.test.ts", test),
+        )
+        edge = _find(
+            edges, EdgeKind.CALLS, "tests/run.test::run", dst="src/memory::Memory.put"
+        )
+        assert edge.confidence == confidence.INFERRED_LOCAL
+
+
 class TestEdgeSetHygiene:
     def test_duplicate_calls_are_deduplicated_keeping_best_confidence(self) -> None:
         util = "def helper(x):\n    return x\n"
