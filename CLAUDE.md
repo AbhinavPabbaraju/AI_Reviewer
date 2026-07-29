@@ -17,23 +17,36 @@ of precision is usually the wrong trade here.
 
 ## Current state — read this first
 
-**M0 (contracts) and M1 (ingestion + symbol graph) are implemented.** M2–M8 are not yet
-built. The repo layout follows `ARCHITECTURE.md` §10:
+**M0 (contracts) and M1 (ingestion + symbol graph) are complete — all three M1 exit
+criteria are measured and green.** M2 (embeddings + hybrid retrieval) is partly built:
+the embedding pipeline, the retriever, and the retrieval-quality gate exist; **the
+pgvector adapter and `POST /search` do not.** M3–M8 are untouched.
 
 ```
 db/migrations/0001_init.sql          forward-only DDL (Postgres 16 + pgvector)
-services/api/app/domain/             pure: contracts, ports, and the indexing algorithms
+services/api/app/domain/             pure: contracts, ports, and the algorithms
   contracts.py  ports.py             M0 output contract + pipeline ports
   base.py                            shared Frozen value-object base
-  indexing/  models.py ports.py filtering.py chunking.py incremental.py resolution.py
+  indexing/  models.py ports.py filtering.py chunking.py incremental.py
+             resolution.py embedding.py
+  retrieval/ models.py ports.py expansion.py fusion.py retriever.py
 services/api/app/infra/              adapters implementing the ports
   source/git_source.py               blobless bare clone → SourceProviderPort
   parsing/{python,typescript}.py     tree-sitter extractors → ParserPort
   parsing/registry.py  base.py       language→parser map + tree-sitter plumbing
-  store/memory.py                    in-memory ParseCache + IndexStore (Postgres adapter TBD)
+  embedding/deterministic.py         offline hashing embedder → EmbeddingPort
+  store/memory.py                    ParseCache + IndexStore + EmbeddingCache
+  retrieval/memory.py                SymbolIndex + VectorStore (pgvector adapter TBD)
 services/worker/worker/pipeline/indexer.py   the Stage I/II orchestrator
-tests/{domain,infra,worker,eval}/    unit tests + the M1 resolution-rate gate
+tests/{domain,infra,worker,eval}/    unit tests + the measured milestone gates
 ```
+
+**What M2 still needs:** a Postgres/pgvector adapter implementing `SymbolIndexPort`,
+`VectorStorePort` and `IndexStorePort` (nothing persists to Postgres yet — the DDL exists
+but has no adapter); a real network `EmbeddingPort` (only the deterministic one exists);
+and `POST /search`, which needs an API app that does not exist yet. Retrieval p95 must be
+re-measured against pgvector — the current number is from the in-memory adapter and is a
+floor, not a forecast.
 
 `app` (under `services/api`) and `worker` (under `services/worker`) are two top-level
 packages installed as one editable distribution (ADR-005); the worker imports `app.domain`.
@@ -90,11 +103,31 @@ The pipeline is layered strictly: **infra parses, domain reasons, the worker seq
   a stale edge. Do not "optimize" by carrying resolved edges forward.
 - **Chunking is by symbol, content-addressed.** `chunk_id = sha256(repo_id | path |
   symbol_fqn | normalized_body)`; a container's chunk excludes its methods' lines (they are
-  chunked separately) to avoid double-embedding. Embeddings themselves are M2 — M1 produces
-  chunks with a null embedding.
+  chunked separately) to avoid double-embedding. That hash is also the embedding cache key,
+  which is what makes a one-line push re-embed one chunk instead of the repository.
 
-**The M1 exit gates** live in `tests/eval/`, and both are *measured and printed*, not merely
-asserted:
+## Stage III (M2) — retrieval
+
+- **Structure first, embeddings as supplement (ADR-002), and the code says so.** Fusion
+  weights graph proximity above cosine, and `test_retrieval_quality.py` measures the
+  provenance split (currently 98% of retrieved items arrive through the graph). If that
+  ratio ever flips, the retriever has quietly become a vector search with extra steps.
+- **M1's confidence tags do real work here.** Expansion proximity is
+  `edge_confidence / (distance + 1)`, so a heuristic edge pulls its neighbour in weakly and
+  a confident two-hop neighbour can outrank a doubtful one-hop one. This is the payoff for
+  never faking confidence in the resolver.
+- **Retrieval ports are set-at-a-time**, one query per BFS level. A neighbours-of-one-symbol
+  port would read better and be an N+1 query against Postgres.
+- **The budget drops whole symbols, never truncates one**, and anchors are never dropped —
+  a pack that dropped the changed code to fit a caller in would be reviewing the wrong
+  thing. An over-budget pack reports the overrun rather than hiding it.
+- **Every item carries a `reason`** ("calls app.store.save"). M7's retrieval inspector
+  renders these; keep them populated when adding a retrieval path.
+
+## The measured gates
+
+Every milestone gate lives in `tests/eval/` and is *measured and printed*, not merely
+asserted (run with `-s`):
 
 - `test_resolution_rate.py` scores the resolver against the hand-labeled corpora in
   `tests/eval/corpus/` (304 Python + 225 TypeScript references; ≥ 0.85 required, currently
@@ -102,6 +135,13 @@ asserted:
 - `test_index_performance.py` (`slow`) builds a real 5,050-file git repo: cold index
   ≈ 21 s of a 240 s budget, single-file push ≈ 4 s of a 10 s budget with exactly one file
   re-parsed and 29,000 chunks reused.
+- `test_retrieval_quality.py` (M2) runs 40 hand-built queries over the same corpora:
+  the file a reviewer would need appears **95%** of the time against a ≥ 90% criterion.
+
+**A gate that cannot fail measures nothing.** The retrieval gate runs at a deliberately
+tight 300-token budget, because at a production-sized budget these small corpora fit
+entirely in one pack and recall is trivially 100% (reported alongside, for scale). If you
+grow the corpora, re-check that the budget still forces the ranking to choose.
 
 **Labels are ground truth, not a recording of resolver output** — that is what makes the
 gate a gate. Write an expectation by reading the corpus source; if the resolver disagrees,
