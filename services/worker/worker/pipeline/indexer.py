@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 from app.domain.indexing.chunking import chunk_parsed_file
+from app.domain.indexing.embedding import ChunkEmbedder, EmbeddingResult
 from app.domain.indexing.filtering import DEFAULT_MAX_BYTES, FileFilter
 from app.domain.indexing.incremental import IndexPlan, plan_index
 from app.domain.indexing.models import (
@@ -71,6 +72,10 @@ class IndexResult:
     chunks_total: int
     chunks_new: int
     chunks_reused: int
+    chunks_embedded: int
+    """Chunks sent to the embedding provider -- what this run actually paid for."""
+    chunks_embedding_reused: int
+    """Distinct chunks whose vector came from the embedding cache."""
     resolution: ResolutionStats
     duration_ms: int
 
@@ -85,17 +90,21 @@ class Indexer:
         parsers: Mapping[Language, ParserPort],
         cache: ParseCachePort,
         store: IndexStorePort,
+        embedder: ChunkEmbedder | None = None,
         max_bytes: int | None = None,
         parser_version: str = _DEFAULT_PARSER_VERSION,
-        embedding_model: str = _NO_EMBEDDING,
     ) -> None:
         self._source = source
         self._parsers = dict(parsers)
         self._cache = cache
         self._store = store
+        self._embedder = embedder
         self._max_bytes = max_bytes
         self._parser_version = parser_version
-        self._embedding_model = embedding_model
+        # The snapshot records which model embedded it, so a model change is
+        # visible in the data rather than inferred; without an embedder the run
+        # still produces a complete symbol graph, honestly labelled unembedded.
+        self._embedding_model = _NO_EMBEDDING if embedder is None else embedder.model
 
     async def index(
         self, *, repository_id: UUID, repo_url: str, commit_sha: str
@@ -144,6 +153,7 @@ class Indexer:
         files: list[SourceFile] = [pf.file for pf in parsed_files]
         known_hashes = await self._store.known_chunk_hashes(repository_id)
         chunks_new = sum(1 for c in chunks if c.content_hash not in known_hashes)
+        embedded = await self._embed(chunks)
 
         snapshot = SnapshotWrite(
             id=uuid4(),
@@ -156,6 +166,7 @@ class Indexer:
             symbols=tuple(symbols),
             edges=resolution.edges,
             chunks=tuple(chunks),
+            embeddings=embedded.vectors,
         )
         await self._store.save(snapshot)
 
@@ -173,11 +184,28 @@ class Indexer:
             chunks_total=len(chunks),
             chunks_new=chunks_new,
             chunks_reused=len(chunks) - chunks_new,
+            chunks_embedded=embedded.embedded,
+            chunks_embedding_reused=embedded.reused,
             resolution=resolution.stats,
             duration_ms=round((time.perf_counter() - started) * 1000),
         )
 
     # -- steps ----------------------------------------------------------- #
+
+    async def _embed(self, chunks: Sequence[Chunk]) -> EmbeddingResult:
+        """Embed the snapshot's chunks, or record honestly that nothing was.
+
+        Embedding every chunk (not only the new ones) is deliberate: the embedder
+        is the component that knows what is already cached, and asking it for the
+        whole snapshot is what produces a complete vector set for the ANN index
+        even when a chunk's *first* embedding attempt happened in a failed run.
+        The cache makes the unchanged 99% free.
+        """
+        if self._embedder is None:
+            return EmbeddingResult(
+                vectors={}, embedded=0, reused=0, duplicates=0, batches=0
+            )
+        return await self._embedder.embed(chunks)
 
     async def _index_file(
         self,

@@ -22,6 +22,7 @@ from uuid import UUID
 from app.domain.base import Frozen
 from app.domain.indexing.models import (
     Chunk,
+    Embedding,
     Language,
     ParsedFile,
     ParsedUnit,
@@ -31,6 +32,7 @@ from app.domain.indexing.models import (
 )
 
 __all__ = [
+    "EmbeddingCachePort",
     "FileEntry",
     "IndexStorePort",
     "ParseCachePort",
@@ -110,6 +112,31 @@ class ParseCachePort(Protocol):
         ...
 
 
+@runtime_checkable
+class EmbeddingCachePort(Protocol):
+    """Content-addressed embedding cache: the reason a re-index is nearly free.
+
+    Keyed by ``(model, content_hash)`` -- the model belongs in the key because
+    vectors from two models are not comparable, so an upgrade must miss rather
+    than silently mix embedding spaces in one ANN index (ARCHITECTURE sec. 4.1).
+    Unlike the parse cache this is worth persisting across repositories: the same
+    vendored file in two repos hashes identically only if its path and repo id
+    match, so sharing is safe by construction of the chunk hash.
+    """
+
+    async def get_many(
+        self, model: str, content_hashes: Sequence[str]
+    ) -> Mapping[str, Embedding]:
+        """Cached vectors for the hashes that have one. Missing keys are absent
+        from the result rather than None-valued -- the caller's next step is
+        "embed the difference", and a sparse map makes that a set operation."""
+        ...
+
+    async def put_many(
+        self, model: str, vectors: Mapping[str, Embedding]
+    ) -> None: ...
+
+
 class SnapshotRef(Frozen):
     """A pointer to a previously stored snapshot, used to diff file blobs."""
 
@@ -121,8 +148,10 @@ class SnapshotWrite(Frozen):
     """The complete graph for one indexing run, persisted atomically.
 
     ``chunks`` are every chunk in the snapshot (reused and freshly produced
-    alike); the store deduplicates by ``content_hash``. The embedding vectors
-    themselves are M2 -- M1 writes chunk rows with a null embedding.
+    alike); the store deduplicates by ``content_hash``. ``embeddings`` maps
+    ``content_hash -> vector`` and may be empty (an indexer configured without an
+    embedder still writes a complete, queryable symbol graph -- the vectors only
+    supplement it).
     """
 
     id: UUID
@@ -135,6 +164,7 @@ class SnapshotWrite(Frozen):
     symbols: tuple[Symbol, ...]
     edges: tuple[SymbolEdge, ...]
     chunks: tuple[Chunk, ...]
+    embeddings: Mapping[str, Embedding] = {}
 
 
 @runtime_checkable

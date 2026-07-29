@@ -10,14 +10,14 @@ is what makes that swap free.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from uuid import UUID
 
-from app.domain.indexing.models import ParsedUnit
+from app.domain.indexing.models import Embedding, ParsedUnit
 from app.domain.indexing.ports import SnapshotRef, SnapshotWrite
 
-__all__ = ["InMemoryIndexStore"]
+__all__ = ["InMemoryEmbeddingCache", "InMemoryIndexStore"]
 
 
 class InMemoryIndexStore:
@@ -65,3 +65,37 @@ class InMemoryIndexStore:
     def snapshot(self, snapshot_id: UUID) -> SnapshotWrite:
         """Read back a persisted snapshot (tests assert on the stored graph)."""
         return self._snapshots[snapshot_id]
+
+
+class InMemoryEmbeddingCache:
+    """In-memory :class:`EmbeddingCachePort`, keyed by ``(model, hash)``.
+
+    Counts its own lookups: "did the cache actually work" is an operational
+    question the M2 budget depends on, and a cache nobody measures is a cache
+    nobody notices has stopped working.
+    """
+
+    def __init__(self) -> None:
+        self._vectors: dict[tuple[str, str], Embedding] = {}
+        self.hits = 0
+        self.misses = 0
+
+    async def get_many(
+        self, model: str, content_hashes: Sequence[str]
+    ) -> Mapping[str, Embedding]:
+        found: dict[str, Embedding] = {}
+        for content_hash in content_hashes:
+            vector = self._vectors.get((model, content_hash))
+            if vector is None:
+                self.misses += 1
+            else:
+                self.hits += 1
+                found[content_hash] = vector
+        return found
+
+    async def put_many(self, model: str, vectors: Mapping[str, Embedding]) -> None:
+        for content_hash, vector in vectors.items():
+            self._vectors[(model, content_hash)] = vector
+
+    def __len__(self) -> int:
+        return len(self._vectors)

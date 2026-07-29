@@ -28,6 +28,7 @@ __all__ = [
     "STAR_IMPORT",
     "Chunk",
     "EdgeKind",
+    "Embedding",
     "Import",
     "Language",
     "ParsedFile",
@@ -39,6 +40,12 @@ __all__ = [
     "SymbolKind",
     "confidence",
 ]
+
+
+type Embedding = tuple[float, ...]
+"""One chunk's vector. Carried keyed by ``content_hash`` rather than as a field
+on :class:`Chunk`, because chunks are content-addressed and deduplicated: two
+identical chunks in a snapshot are one embedding, paid for once."""
 
 
 STAR_IMPORT: Final = "*"

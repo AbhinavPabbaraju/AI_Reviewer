@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from uuid import uuid4
 
+from app.domain.indexing.embedding import ChunkEmbedder
+from app.infra.embedding.deterministic import DeterministicEmbedder
 from app.infra.parsing.registry import default_parsers
 from app.infra.source.git_source import GitSourceProvider
-from app.infra.store.memory import InMemoryIndexStore
+from app.infra.store.memory import InMemoryEmbeddingCache, InMemoryIndexStore
 from tests.conftest import GitRepo
 from worker.pipeline.indexer import Indexer
 
@@ -156,3 +158,81 @@ class TestIncremental:
         assert result.files_reused == 0  # cache was cold
         assert result.files_indexed == 2  # but the snapshot is still complete
         assert result.resolution.resolution_rate == 1.0
+
+
+class TestEmbedding:
+    """Embeddings ride along with indexing, and are paid for once (sec. 4.1)."""
+
+    def _embedder(self, cache: InMemoryEmbeddingCache) -> ChunkEmbedder:
+        return ChunkEmbedder(
+            embeddings=DeterministicEmbedder(dimensions=64), cache=cache
+        )
+
+    async def test_snapshot_carries_a_vector_for_every_chunk(
+        self, make_git_repo: Callable[[], GitRepo]
+    ) -> None:
+        repo = make_git_repo()
+        sha = repo.commit(_APP, "init")
+        store, cache = InMemoryIndexStore(), InMemoryEmbeddingCache()
+
+        result = await Indexer(
+            source=GitSourceProvider(),
+            parsers=default_parsers(),
+            cache=store,
+            store=store,
+            embedder=self._embedder(cache),
+        ).index(repository_id=uuid4(), repo_url=repo.url, commit_sha=sha)
+
+        snapshot = store.snapshot(result.snapshot_id)
+        assert result.chunks_embedded == result.chunks_total
+        assert {chunk.content_hash for chunk in snapshot.chunks} == set(
+            snapshot.embeddings
+        )
+        assert snapshot.embedding_model.startswith("deterministic-hash")
+
+    async def test_single_file_push_only_embeds_the_changed_chunks(
+        self, make_git_repo: Callable[[], GitRepo]
+    ) -> None:
+        repo = make_git_repo()
+        repo_id = uuid4()
+        store, cache = InMemoryIndexStore(), InMemoryEmbeddingCache()
+        sha = repo.commit(_APP, "init")
+
+        def indexer() -> Indexer:
+            return Indexer(
+                source=GitSourceProvider(),
+                parsers=default_parsers(),
+                cache=store,
+                store=store,
+                embedder=self._embedder(cache),
+            )
+
+        cold = await indexer().index(
+            repository_id=repo_id, repo_url=repo.url, commit_sha=sha
+        )
+        sha = repo.commit(
+            {"app/util.py": "def helper(x):\n    return x * 3\n"}, "tweak"
+        )
+        warm = await indexer().index(
+            repository_id=repo_id, repo_url=repo.url, commit_sha=sha
+        )
+
+        assert warm.chunks_embedded == 1
+        assert warm.chunks_embedding_reused == cold.chunks_embedded - 1
+
+    async def test_indexing_without_an_embedder_is_honestly_unembedded(
+        self, make_git_repo: Callable[[], GitRepo]
+    ) -> None:
+        repo = make_git_repo()
+        sha = repo.commit(_APP, "init")
+        store = InMemoryIndexStore()
+
+        result = await _indexer(store).index(
+            repository_id=uuid4(), repo_url=repo.url, commit_sha=sha
+        )
+
+        snapshot = store.snapshot(result.snapshot_id)
+        assert result.chunks_embedded == 0
+        assert snapshot.embeddings == {}
+        assert snapshot.embedding_model == "none"  # not a model that never ran
+        assert result.symbols > 0  # the graph is still complete
