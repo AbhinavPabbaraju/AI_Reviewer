@@ -44,6 +44,9 @@ Everything runs in a virtualenv at `.venv` (Python 3.14). One-time: `.venv/bin/p
 -e ".[dev]"`.
 
 - **Tests:** `.venv/bin/python -m pytest`  ·  single test: `… -m pytest tests/eval/test_resolution_rate.py::TestPythonResolutionRate -q`
+- **Measured gates:** `… -m pytest tests/eval -s` prints the numbers (`-s` matters — the
+  exit criteria are *reported*, not just asserted). The latency gate is marked `slow` and
+  deselected by default: run it with `… -m pytest -m slow -s`.
 - **Types (strict):** `.venv/bin/python -m mypy` — strict, over the `app` and `worker`
   packages. Must stay clean.
 - **Lint:** `.venv/bin/ruff check services tests` (Ruff is the sole Python linter — it
@@ -67,7 +70,15 @@ The pipeline is layered strictly: **infra parses, domain reasons, the worker seq
 - **The resolver is language-agnostic by construction.** It keys symbols by `(module, name)`
   and `(parent, name)` and never rebuilds an fqn by string surgery, so one code path resolves
   both languages. The *only* language-specific step is import-module resolution
-  (`_resolve_module` / `_from_module_path`: dotted packages vs relative paths).
+  (`_resolve_module` / `_from_module_path`: dotted packages vs relative paths). Re-export
+  chains (a package `__init__`, a TS barrel `index.ts`) are followed through the same code
+  path, which is why `export … from` is parsed *as an import*: a re-export is a binding
+  brought in and re-exposed, so the resolver needs no TS-specific concept for it.
+- **Type hints from the parser are validated, never trusted.** `Reference.receiver_type`
+  carries "this local was assigned `Thing(...)`" and nothing more; the resolver uses it only
+  if the name resolves to a class in this repo that declares the member, and tags the result
+  `confidence.INFERRED_LOCAL` (0.9, not EXACT — the binding is last-write-wins). A parser
+  that decided what was a class would be inventing type information.
 - **Confidence is never faked.** An unresolved reference is kept with its textual target and a
   floor confidence (`confidence.UNRESOLVED`), never dropped — ARCHITECTURE §4.2. External
   (stdlib/vendor) references are `confidence.EXTERNAL` and excluded from the resolution-rate
@@ -82,10 +93,22 @@ The pipeline is layered strictly: **infra parses, domain reasons, the worker seq
   chunked separately) to avoid double-embedding. Embeddings themselves are M2 — M1 produces
   chunks with a null embedding.
 
-**The M1 exit gate** lives in `tests/eval/test_resolution_rate.py`: a hand-labeled corpus per
-language whose ground-truth edges must resolve at ≥ 0.85 accuracy. It is measured, not
-asserted, and is the regression gate for any resolver change. Growing it = adding labeled
-expectations to the two lists (target: 200 references/language).
+**The M1 exit gates** live in `tests/eval/`, and both are *measured and printed*, not merely
+asserted:
+
+- `test_resolution_rate.py` scores the resolver against the hand-labeled corpora in
+  `tests/eval/corpus/` (304 Python + 225 TypeScript references; ≥ 0.85 required, currently
+  0.990 / 0.996). This is the regression gate for any resolver or parser change.
+- `test_index_performance.py` (`slow`) builds a real 5,050-file git repo: cold index
+  ≈ 21 s of a 240 s budget, single-file push ≈ 4 s of a 10 s budget with exactly one file
+  re-parsed and 29,000 chunks reused.
+
+**Labels are ground truth, not a recording of resolver output** — that is what makes the
+gate a gate. Write an expectation by reading the corpus source; if the resolver disagrees,
+either it has a bug or the case is genuinely ambiguous, and the honest move is to leave the
+correct label in place as a known miss (the four current ones are commented as such). Three
+label kinds: an fqn, `EXTERNAL(name)` (leaves the repo), and `UNRESOLVED(name)` (**must not**
+bind to any repo symbol — this is the one that penalizes fabricated edges).
 
 ## Architecture that spans files
 

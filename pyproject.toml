@@ -34,8 +34,14 @@ include = ["app*", "worker*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["services/api", "services/worker"]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -m 'not slow'"
 asyncio_mode = "auto"
+markers = [
+    # The M1 latency gate builds a real 5,000-file git repository and indexes it
+    # twice. It is an exit criterion and must run in CI (`pytest -m slow`), but
+    # it is minutes long, so the default suite stays fast enough to run on save.
+    "slow: measured performance gates; deselected by default",
+]
 
 [tool.ruff]
 target-version = "py312"
