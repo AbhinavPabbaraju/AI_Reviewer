@@ -17,17 +17,35 @@ of precision is usually the wrong trade here.
 
 ## Current state — read this first
 
-**M0–M2 are complete** — every exit criterion measured and green, including retrieval p95
-against real pgvector (16 ms of an 800 ms budget). **M3 is half built: the verification
-gate is done and its exit criterion is green** (zero fabrications escape over 20 seeded
-PRs). M4–M8 are untouched.
+**M0–M3 are complete** — every exit criterion measured and green, including retrieval p95
+against real pgvector (16 ms of an 800 ms budget) and zero fabrications escaping the
+verification gate over 20 seeded PRs. M4–M8 are untouched.
 
-**What M3 still needs:** prompt templates with fenced untrusted-content blocks, constrained
-JSON decoding into `Finding` at temperature 0, prompt versioning, an `LLMPort` adapter, and
-the findings budget (top-N by `severity × confidence`). Dedup already landed — it is a
-gate. The gate consumes `Finding` objects, so none of that is required for it to work; the
-adversarial corpus in `tests/eval/corpus/seeded_prs.py` stands in for the model and becomes
-M6's recorded `LLMPort` payload.
+## Argus runs for free
+
+**No AI credits are required to operate any part of this system, and that is a
+constraint, not a coincidence.** Every stage has a free implementation:
+
+| Stage | Free path |
+|---|---|
+| Embedding | `DeterministicEmbedder` — offline hashing, no network |
+| Retrieval | structure-first over local Postgres; 98% of items arrive via the graph |
+| LLM review | `OllamaLLM` — a local model on your own hardware, or `RecordedLLM` replay |
+| Verification | pure computation, no model involved |
+
+`tests/eval/test_review_pipeline.py` runs M1→M3 end to end and **asserts
+`cost_usd == 0.0`** across the whole run. Keep it that way: an adapter that reports a
+nonzero price corrupts the one number the M6 harness compares configurations on.
+
+`OllamaLLM.cost_usd` is always `0.0` — that is a fact about local inference, not a
+placeholder. Running free trades **recall**, not precision: a small local model finds
+fewer defects, but its fabrications hit the same verification gate as any other model's.
+Precision is structural; recall is what you give up.
+
+**A paid adapter is optional and not built.** If one is added, note that `temperature` was
+*removed* on Anthropic's current models (Opus 5 / 4.8 / 4.7) and sending it returns a 400 —
+so `LLMPort.complete`'s `temperature` argument must be dropped by that adapter, not passed
+through. It is kept on the port because local providers do honour it.
 
 ```
 db/migrations/0001_init.sql          forward-only DDL (Postgres + pgvector)
@@ -39,6 +57,7 @@ services/api/app/domain/             pure: contracts, ports, and the algorithms
              resolution.py embedding.py
   retrieval/ models.py ports.py expansion.py fusion.py retriever.py
   review/    diff.py grouping.py verification.py ports.py
+             prompts.py decoding.py reviewer.py budget.py
 services/api/app/infra/              adapters implementing the ports
   source/git_source.py               blobless bare clone → SourceProviderPort
   parsing/{python,typescript}.py     tree-sitter extractors → ParserPort
@@ -50,6 +69,7 @@ services/api/app/infra/              adapters implementing the ports
   parsing/syntax.py                  tree-sitter SyntaxChecker → PATCH_PARSES
   github/fake.py                     in-memory GitHubPort (M6 harness + gate tests)
   review/head_files.py               HeadFilePort bound to one (repo, sha)
+  llm/ollama.py  llm/recorded.py     free LLMPorts: local model, and replay
 services/api/app/api/                FastAPI: main.py deps.py schemas.py routers/
 services/api/app/config.py           env-driven Settings (ARGUS_ prefix)
 services/worker/worker/pipeline/indexer.py   the Stage I/II orchestrator
@@ -213,6 +233,31 @@ The pipeline is layered strictly: **infra parses, domain reasons, the worker seq
 - **The review unit is a symbol, not a hunk.** Three hunks in one function are one change;
   reviewing them separately asks the model the same question three times with less context
   each time. Grouping uses the parsed symbol table, not git's `@@` heading guess.
+
+## Stage V (M3) — the review engine
+
+- **The model emits a draft, never a `Finding`.** `DraftFinding` carries the claim;
+  identity (`id`, `run_id`), attribution (`source`, `prompt_version`, `model`) and
+  verification status are assigned by `decoding.py`. A model that could write
+  `"verification": "verified"` would be grading its own work, and one that could set
+  `"source": "semgrep"` could launder an unverifiable claim as a deterministic one.
+- **Repository content is fenced, and the fence is neutralized.** A PR can contain
+  `</untrusted-diff>` followed by instructions. `prompts.py` strips any closing tag from
+  the content, so a diff cannot close its own fence and escape into the instruction
+  channel. Tested with case and whitespace variants — this is a security boundary, not
+  formatting.
+- **Decoding is total.** Model output is the least trustworthy input in the system, so
+  `decode_findings` never raises: malformed JSON, markdown fences, surrounding prose,
+  contract violations and out-of-scope paths all become *counted rejects*.
+  `reject_rate` is the companion metric to the gate's drop rate.
+- **A provider failure loses one group, not the review.** `Reviewer` catches broadly on
+  purpose (adapters raise provider-specific exceptions the domain must not import) and
+  reports `completeness` — a review that silently covered half the diff is worse than one
+  that says so.
+- **The budget suppresses, never deletes.** Findings over the per-PR limit are marked
+  rejected with `CONFIDENCE_FLOOR` and retained. The ordering is *total* — priority, then
+  severity, then confidence, then fingerprint, then id — because a tie broken by dict
+  ordering would make the same run post different comments on different days.
 
 ## The measured gates
 

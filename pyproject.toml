@@ -20,6 +20,9 @@ dependencies = [
     "fastapi>=0.115",
     "pydantic-settings>=2.0",
     "uvicorn[standard]>=0.30",
+    # The Ollama adapter is a first-class runtime path (free, local review), so
+    # its HTTP client is a runtime dependency rather than a test-only one.
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -29,10 +32,9 @@ dev = [
     "pytest-asyncio>=0.23",
     "mypy>=1.9",
     "ruff>=0.4",
-    # The API tests drive the real ASGI app rather than calling handlers:
-    # httpx transports the requests, asgi-lifespan runs startup/shutdown so the
-    # app opens its own pool exactly as it does in production.
-    "httpx>=0.27",
+    # asgi-lifespan runs the app's startup/shutdown in tests so it opens its
+    # own pool exactly as it does in production. (httpx is a runtime dependency,
+    # declared above, and also transports the API tests.)
     "asgi-lifespan>=2.1",
 ]
 
