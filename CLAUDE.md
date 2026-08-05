@@ -49,9 +49,11 @@ exists, so `POST /search` refuses any snapshot embedded by a different model rat
 comparing vectors across two embedding spaces. That guard is the thing to keep when a
 network adapter lands.
 
-**Known thin margin.** The M1 incremental budget (single-file push < 10 s) now measures
-**9.5 s** with real persistence, up from 6.2 s in-memory. Persistence costs ~2.5 s per
-push, and the profile is symbols 0.91 s + edges 0.78 s + chunk membership 0.63 s. Symbols
+**Known thin margin.** The M1 incremental budget (single-file push < 10 s) is the one to
+watch now that persistence is real. Observed **5.8–9.5 s** across runs on the same machine
+(in-memory: 3.8–6.2 s) — it is sensitive to machine load and page cache, and the 9.5 s end
+of that range is uncomfortably close to the budget. Persistence costs ~2.5 s per push, and
+the profile is symbols 0.91 s + edges 0.78 s + chunk membership 0.63 s. Symbols
 and edges are rewritten in full on every snapshot because they are snapshot-scoped rows.
 The fix, if the margin gets uncomfortable, is to derive membership from the snapshot's
 file list rather than storing it: a symbol and a chunk both belong to a *blob*, so
