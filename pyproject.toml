@@ -16,6 +16,7 @@ dependencies = [
     "tree-sitter>=0.23",
     "tree-sitter-python>=0.23",
     "tree-sitter-typescript>=0.23",
+    "asyncpg>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -65,4 +66,13 @@ packages = ["app", "worker"]
 
 [[tool.mypy.overrides]]
 module = ["tree_sitter_python.*", "tree_sitter_typescript.*"]
+ignore_missing_imports = true
+
+# asyncpg ships no py.typed. The Postgres adapters therefore hold their
+# connections as `Any` and convert every row into a validated domain model at
+# the boundary -- the pydantic constructors in `_to_symbol`/`_to_chunk` are
+# where the types actually come back, and they run at runtime rather than only
+# under mypy.
+[[tool.mypy.overrides]]
+module = ["asyncpg.*"]
 ignore_missing_imports = true

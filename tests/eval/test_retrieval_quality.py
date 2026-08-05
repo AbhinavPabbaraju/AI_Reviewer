@@ -24,25 +24,21 @@ Run ``pytest tests/eval/test_retrieval_quality.py -s`` to see the report.
 from __future__ import annotations
 
 import statistics
-import time
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from uuid import uuid4
+from collections.abc import Sequence
 
 import pytest
 
-from app.domain.contracts import CodeSpan
-from app.domain.indexing.chunking import chunk_parsed_file
-from app.domain.indexing.embedding import ChunkEmbedder
-from app.domain.indexing.models import Chunk, ParsedFile, Symbol
-from app.domain.indexing.ports import SnapshotWrite
-from app.domain.indexing.resolution import Resolver
-from app.domain.retrieval.models import ContextPack, Provenance
+from app.domain.retrieval.models import Provenance
 from app.domain.retrieval.retriever import ContextRetriever, RetrievalConfig
 from app.infra.embedding.deterministic import DeterministicEmbedder
 from app.infra.retrieval.memory import InMemorySymbolIndex, InMemoryVectorStore
-from app.infra.store.memory import InMemoryEmbeddingCache
-from tests.conftest import parse_python, parse_typescript
+from tests.eval.corpus.indexed import (
+    EMBEDDING_DIMENSIONS,
+    IndexedCorpus,
+    QueryOutcome,
+    build_corpus,
+    run_queries,
+)
 from tests.eval.corpus.python_corpus import PY_CORPUS, PY_TEST_FILES
 from tests.eval.corpus.retrieval_queries import PY_QUERIES, TS_QUERIES, RetrievalQuery
 from tests.eval.corpus.typescript_corpus import TS_CORPUS, TS_TEST_FILES
@@ -67,118 +63,39 @@ a production-shaped budget is reported alongside, for scale.
 
 PRODUCTION_TOKEN_BUDGET = 12_000
 
-_EMBEDDING_DIMENSIONS = 256
 
-
-@dataclass(frozen=True, slots=True)
-class Corpus:
-    """An indexed corpus, able to serve retrievers at any token budget."""
-
-    repository_id: str
-    snapshot: SnapshotWrite
-    symbols: Mapping[str, Symbol]
-
-    def span_of(self, fqn: str) -> CodeSpan:
-        symbol = self.symbols.get(fqn)
-        assert symbol is not None, f"query names a symbol that does not exist: {fqn}"
-        return symbol.span
-
-    def retriever(self, token_budget: int) -> ContextRetriever:
-        return ContextRetriever(
-            index=InMemorySymbolIndex(self.snapshot),
-            vectors=InMemoryVectorStore(self.snapshot),
-            embeddings=DeterministicEmbedder(dimensions=_EMBEDDING_DIMENSIONS),
-            config=RetrievalConfig(token_budget=token_budget),
-        )
-
-
-async def _build(
-    sources: Mapping[str, str], test_files: frozenset[str], *, typescript: bool
-) -> Corpus:
-    """Index a corpus without git: parse, resolve, chunk, embed, serve."""
-    parse = parse_typescript if typescript else parse_python
-    repository_id = uuid4()
-    parsed: list[ParsedFile] = [
-        parse(path, text, is_test=path in test_files) for path, text in sources.items()
-    ]
-    resolution = Resolver(parsed).resolve()
-    chunks: list[Chunk] = [
-        chunk
-        for unit in parsed
-        for chunk in chunk_parsed_file(repository_id, unit, sources[unit.file.path])
-    ]
-    embedder = ChunkEmbedder(
-        embeddings=DeterministicEmbedder(dimensions=_EMBEDDING_DIMENSIONS),
-        cache=InMemoryEmbeddingCache(),
+def _retriever(corpus: IndexedCorpus, token_budget: int) -> ContextRetriever:
+    """The in-memory adapter set. ``test_retrieval_pgvector.py`` wires the same
+    ``ContextRetriever`` to Postgres and runs these same queries through it."""
+    return ContextRetriever(
+        index=InMemorySymbolIndex(corpus.snapshot),
+        vectors=InMemoryVectorStore(corpus.snapshot),
+        embeddings=DeterministicEmbedder(dimensions=EMBEDDING_DIMENSIONS),
+        config=RetrievalConfig(token_budget=token_budget),
     )
-    embedded = await embedder.embed(chunks)
-
-    snapshot = SnapshotWrite(
-        id=uuid4(),
-        repository_id=repository_id,
-        commit_sha="0" * 40,
-        parent_snapshot_id=None,
-        parser_version="treesitter/1",
-        embedding_model=embedder.model,
-        files=tuple(unit.file for unit in parsed),
-        symbols=tuple(s for unit in parsed for s in unit.symbols),
-        edges=resolution.edges,
-        chunks=tuple(chunks),
-        embeddings=embedded.vectors,
-    )
-    return Corpus(
-        repository_id=str(repository_id),
-        snapshot=snapshot,
-        symbols={s.fqn: s for unit in parsed for s in unit.symbols},
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class QueryOutcome:
-    query: RetrievalQuery
-    hit: bool
-    duration_ms: float
-    pack: ContextPack
 
 
 async def _run(
-    corpus: Corpus,
+    corpus: IndexedCorpus,
     queries: Sequence[RetrievalQuery],
     token_budget: int = GATE_TOKEN_BUDGET,
 ) -> list[QueryOutcome]:
-    retriever = corpus.retriever(token_budget)
-    outcomes: list[QueryOutcome] = []
-    for query in queries:
-        hunk = corpus.span_of(query.changed_symbol)
-        started = time.perf_counter()
-        pack = await retriever.retrieve(
-            repository_id=corpus.repository_id, hunks=[hunk]
-        )
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        outcomes.append(
-            QueryOutcome(
-                query=query,
-                hit=query.needs in pack.paths,
-                duration_ms=elapsed_ms,
-                pack=pack,
-            )
-        )
-    return outcomes
+    return await run_queries(_retriever(corpus, token_budget), corpus, queries)
 
 
 @pytest.fixture(scope="module")
-async def python_corpus() -> Corpus:
-    return await _build(PY_CORPUS, PY_TEST_FILES, typescript=False)
+async def python_corpus() -> IndexedCorpus:
+    return await build_corpus(PY_CORPUS, PY_TEST_FILES, typescript=False)
 
 
 @pytest.fixture(scope="module")
-async def typescript_corpus() -> Corpus:
-    return await _build(TS_CORPUS, TS_TEST_FILES, typescript=True)
+async def typescript_corpus() -> IndexedCorpus:
+    return await build_corpus(TS_CORPUS, TS_TEST_FILES, typescript=True)
 
 
 @pytest.fixture(scope="module")
 async def outcomes(
-    python_corpus: Corpus, typescript_corpus: Corpus
+    python_corpus: IndexedCorpus, typescript_corpus: IndexedCorpus
 ) -> list[QueryOutcome]:
     """The gate: packs squeezed to a budget where ranking has to be right."""
     return [
@@ -189,7 +106,7 @@ async def outcomes(
 
 @pytest.fixture(scope="module")
 async def production_budget_outcomes(
-    python_corpus: Corpus, typescript_corpus: Corpus
+    python_corpus: IndexedCorpus, typescript_corpus: IndexedCorpus
 ) -> list[QueryOutcome]:
     return [
         *await _run(python_corpus, PY_QUERIES, PRODUCTION_TOKEN_BUDGET),

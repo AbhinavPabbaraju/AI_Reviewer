@@ -20,14 +20,18 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from typing import Any
 from uuid import uuid4
 
 import pytest
 
+from app.domain.indexing.ports import IndexStorePort, ParseCachePort
 from app.infra.parsing.registry import default_parsers
 from app.infra.source.git_source import GitSourceProvider
 from app.infra.store.memory import InMemoryIndexStore
+from app.infra.store.postgres import PostgresIndexStore
 from tests.conftest import GitRepo
+from tests.pg import create_repository
 from worker.pipeline.indexer import Indexer, IndexResult
 
 pytestmark = pytest.mark.slow
@@ -113,9 +117,20 @@ def _generate_repo_files() -> dict[str, str]:
     return files
 
 
-def _indexer(store: InMemoryIndexStore, source: GitSourceProvider) -> Indexer:
+def _indexer(
+    store: InMemoryIndexStore,
+    source: GitSourceProvider,
+    index_store: IndexStorePort | None = None,
+) -> Indexer:
+    """``store`` always backs the parse cache; ``index_store`` overrides where
+    the snapshot is persisted, so the same run can be re-timed against Postgres
+    without changing anything else about it."""
+    cache: ParseCachePort = store
     return Indexer(
-        source=source, parsers=default_parsers(), cache=store, store=store
+        source=source,
+        parsers=default_parsers(),
+        cache=cache,
+        store=index_store or store,
     )
 
 
@@ -183,3 +198,79 @@ class TestIndexingLatency:
             f"single-file re-index took {warm_seconds:.1f}s, over the "
             f"{INCREMENTAL_BUDGET_SECONDS}s M1 budget"
         )
+
+
+class TestPostgresIndexingLatency:
+    """The same two budgets, with snapshots persisted to Postgres.
+
+    ``TestIndexingLatency`` above measures parsing, resolution and chunking with
+    an in-memory store, so it says nothing about what persistence costs -- and
+    persistence is where a naive adapter would blow the budget, because a cold
+    index of this repository writes roughly 90,000 rows across four tables. The
+    store loads them with ``COPY`` into temp tables and four ``INSERT ... SELECT``
+    statements for exactly that reason; this is the measurement that says whether
+    the reason was real.
+
+    The parse cache stays in memory (it is Redis in production, not Postgres),
+    so the delta between the two classes is persistence and nothing else.
+
+    Skips without ``ARGUS_TEST_DATABASE_URL``; see ``tests/pg.py``.
+    """
+
+    async def test_cold_and_incremental_indexing_meet_budget(
+        self, make_git_repo: Callable[[], GitRepo], pg_pool: Any
+    ) -> None:
+        repo = make_git_repo()
+        files = _generate_repo_files()
+        head = repo.commit(files, "generated corpus")
+
+        cache = InMemoryIndexStore()
+        source = GitSourceProvider()
+        repository_id = await create_repository(pg_pool)
+        store = PostgresIndexStore(pg_pool)
+
+        started = time.perf_counter()
+        cold = await _indexer(cache, source, store).index(
+            repository_id=repository_id, repo_url=repo.url, commit_sha=head
+        )
+        cold_seconds = time.perf_counter() - started
+        _report("cold (postgres)", cold, cold_seconds, COLD_BUDGET_SECONDS)
+
+        assert cold.files_indexed >= SCALE_FILES
+        assert cold_seconds < COLD_BUDGET_SECONDS, (
+            f"cold index of {cold.files_indexed} files took {cold_seconds:.1f}s "
+            f"with Postgres persistence, over the {COLD_BUDGET_SECONDS}s budget"
+        )
+
+        touched = "pkg0/mod0.py"
+        head = repo.commit(
+            {touched: files[touched] + "\n\ndef added(value: int) -> int:\n    return value\n"},
+            "single-file push",
+        )
+
+        started = time.perf_counter()
+        warm = await _indexer(cache, source, store).index(
+            repository_id=repository_id, repo_url=repo.url, commit_sha=head
+        )
+        warm_seconds = time.perf_counter() - started
+        _report("incremental (postgres)", warm, warm_seconds, INCREMENTAL_BUDGET_SECONDS)
+
+        assert warm.files_parsed == 1, "only the changed blob may be re-parsed"
+        assert warm_seconds < INCREMENTAL_BUDGET_SECONDS, (
+            f"single-file re-index took {warm_seconds:.1f}s with Postgres "
+            f"persistence, over the {INCREMENTAL_BUDGET_SECONDS}s budget"
+        )
+
+        # The payoff the schema is shaped around: the second snapshot shares
+        # almost every chunk row (and every embedding) with the first.
+        distinct = await pg_pool.fetchval(
+            "SELECT count(*) FROM chunks WHERE repository_id = $1", repository_id
+        )
+        reused = await pg_pool.fetchval(
+            "SELECT chunks_reused FROM index_snapshots WHERE id = $1", warm.snapshot_id
+        )
+        print(
+            f"[postgres] {reused} of {warm.chunks_total} chunks already stored; "
+            f"{distinct} distinct chunk rows for the repository after two commits"
+        )
+        assert reused > 0, "the second index must reuse stored chunks"

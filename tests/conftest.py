@@ -1,8 +1,12 @@
-"""Shared fixtures and builders for the M1 test suite.
+"""Shared fixtures and builders for the test suite.
 
 Two things every test needs: a cheap way to turn source text into a
 ``SourceFile``/``ParsedFile`` without a git round-trip, and a real on-disk git
 repository to exercise the source provider and the indexer end to end.
+
+The Postgres fixtures live in ``tests/pg.py`` and are re-exported here so that
+``pg_pool``/``pg_repository`` resolve by name in any test module. They skip
+themselves when ``ARGUS_TEST_DATABASE_URL`` is unset.
 """
 
 from __future__ import annotations
@@ -17,6 +21,9 @@ import pytest
 from app.domain.indexing.models import Language, ParsedFile, SourceFile
 from app.infra.parsing.python import PythonParser
 from app.infra.parsing.typescript import TypeScriptParser
+from tests.pg import pg_dsn, pg_pool, pg_repository
+
+__all__ = ["pg_dsn", "pg_pool", "pg_repository"]
 
 _PY = PythonParser()
 _TS = TypeScriptParser()
