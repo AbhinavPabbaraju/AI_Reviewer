@@ -28,6 +28,7 @@ returns; the port is specified in similarity, so the query converts.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Self
 from uuid import UUID
 
@@ -42,10 +43,32 @@ from app.domain.indexing.models import (
 )
 from app.domain.ports import ChunkMatch
 
-__all__ = ["PostgresSymbolIndex", "PostgresVectorStore", "latest_ready_snapshot"]
+__all__ = [
+    "PostgresSymbolIndex",
+    "PostgresVectorStore",
+    "ServingSnapshot",
+    "latest_ready_snapshot",
+]
 
 
-async def latest_ready_snapshot(pool: Any, repository_id: UUID) -> UUID | None:
+@dataclass(frozen=True, slots=True)
+class ServingSnapshot:
+    """The snapshot a read is being served from.
+
+    Carries ``embedding_model`` because a query vector is only comparable to
+    stored vectors produced by the same model. Anything embedding a query has to
+    be able to check that, and the snapshot is the only place that records what
+    actually embedded the corpus.
+    """
+
+    id: UUID
+    commit_sha: str
+    embedding_model: str
+
+
+async def latest_ready_snapshot(
+    pool: Any, repository_id: UUID
+) -> ServingSnapshot | None:
     """The snapshot retrieval should serve for a repository.
 
     Separate from :class:`app.infra.store.postgres.PostgresIndexStore` because
@@ -54,14 +77,20 @@ async def latest_ready_snapshot(pool: Any, repository_id: UUID) -> UUID | None:
     """
     row = await pool.fetchrow(
         """
-        SELECT id FROM index_snapshots
+        SELECT id, commit_sha, embedding_model FROM index_snapshots
         WHERE repository_id = $1 AND status = 'ready'
         ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
         repository_id,
     )
-    return None if row is None else UUID(str(row["id"]))
+    if row is None:
+        return None
+    return ServingSnapshot(
+        id=UUID(str(row["id"])),
+        commit_sha=row["commit_sha"],
+        embedding_model=row["embedding_model"],
+    )
 
 
 class _SnapshotScoped:
@@ -91,10 +120,10 @@ class PostgresSymbolIndex(_SnapshotScoped):
         """Bind to the repository's newest ready snapshot, or ``None`` if it has
         never been indexed -- which is a real state (a fresh installation), not
         an error, and the caller has to decide what to do about it."""
-        snapshot_id = await latest_ready_snapshot(pool, repository_id)
-        if snapshot_id is None:
+        serving = await latest_ready_snapshot(pool, repository_id)
+        if serving is None:
             return None
-        return cls(pool, repository_id, snapshot_id)
+        return cls(pool, repository_id, serving.id)
 
     # -- SymbolIndexPort --------------------------------------------------- #
 
@@ -201,10 +230,10 @@ class PostgresVectorStore(_SnapshotScoped):
 
     @classmethod
     async def for_latest(cls, pool: Any, repository_id: UUID) -> Self | None:
-        snapshot_id = await latest_ready_snapshot(pool, repository_id)
-        if snapshot_id is None:
+        serving = await latest_ready_snapshot(pool, repository_id)
+        if serving is None:
             return None
-        return cls(pool, repository_id, snapshot_id)
+        return cls(pool, repository_id, serving.id)
 
     async def search(
         self,

@@ -17,13 +17,13 @@ of precision is usually the wrong trade here.
 
 ## Current state — read this first
 
-**M0 (contracts) and M1 (ingestion + symbol graph) are complete — all three M1 exit
-criteria are measured and green.** M2 (embeddings + hybrid retrieval) is partly built:
-the embedding pipeline, the retriever, and the retrieval-quality gate exist; **the
-pgvector adapter and `POST /search` do not.** M3–M8 are untouched.
+**M0 (contracts), M1 (ingestion + symbol graph) and M2 (embeddings + hybrid retrieval)
+are complete — every exit criterion is measured and green**, including retrieval p95
+against real pgvector (16 ms of an 800 ms budget). M3–M8 are untouched.
 
 ```
-db/migrations/0001_init.sql          forward-only DDL (Postgres 16 + pgvector)
+db/migrations/0001_init.sql          forward-only DDL (Postgres + pgvector)
+db/migrations/0002_snapshot_scoping.sql  snapshot-scoped reads; chunks outlive snapshots
 services/api/app/domain/             pure: contracts, ports, and the algorithms
   contracts.py  ports.py             M0 output contract + pipeline ports
   base.py                            shared Frozen value-object base
@@ -35,18 +35,28 @@ services/api/app/infra/              adapters implementing the ports
   parsing/{python,typescript}.py     tree-sitter extractors → ParserPort
   parsing/registry.py  base.py       language→parser map + tree-sitter plumbing
   embedding/deterministic.py         offline hashing embedder → EmbeddingPort
-  store/memory.py                    ParseCache + IndexStore + EmbeddingCache
-  retrieval/memory.py                SymbolIndex + VectorStore (pgvector adapter TBD)
+  store/{memory,postgres}.py         ParseCache + IndexStore + EmbeddingCache
+  retrieval/{memory,postgres}.py     SymbolIndex + VectorStore
+  db/{pool,migrate}.py               asyncpg pool + vector codec, migration runner
+services/api/app/api/                FastAPI: main.py deps.py schemas.py routers/
+services/api/app/config.py           env-driven Settings (ARGUS_ prefix)
 services/worker/worker/pipeline/indexer.py   the Stage I/II orchestrator
-tests/{domain,infra,worker,eval}/    unit tests + the measured milestone gates
+tests/{domain,infra,worker,api,eval}/  unit tests + the measured milestone gates
 ```
 
-**What M2 still needs:** a Postgres/pgvector adapter implementing `SymbolIndexPort`,
-`VectorStorePort` and `IndexStorePort` (nothing persists to Postgres yet — the DDL exists
-but has no adapter); a real network `EmbeddingPort` (only the deterministic one exists);
-and `POST /search`, which needs an API app that does not exist yet. Retrieval p95 must be
-re-measured against pgvector — the current number is from the in-memory adapter and is a
-floor, not a forecast.
+**What M2 still lacks:** a real network `EmbeddingPort` — only `DeterministicEmbedder`
+exists, so `POST /search` refuses any snapshot embedded by a different model rather than
+comparing vectors across two embedding spaces. That guard is the thing to keep when a
+network adapter lands.
+
+**Known thin margin.** The M1 incremental budget (single-file push < 10 s) now measures
+**9.5 s** with real persistence, up from 6.2 s in-memory. Persistence costs ~2.5 s per
+push, and the profile is symbols 0.91 s + edges 0.78 s + chunk membership 0.63 s. Symbols
+and edges are rewritten in full on every snapshot because they are snapshot-scoped rows.
+The fix, if the margin gets uncomfortable, is to derive membership from the snapshot's
+file list rather than storing it: a symbol and a chunk both belong to a *blob*, so
+`(path, blob_sha)` identifies them across snapshots and only genuinely global rows (edges)
+need rewriting. That is a migration 0003, not a tweak — measure before starting it.
 
 `app` (under `services/api`) and `worker` (under `services/worker`) are two top-level
 packages installed as one editable distribution (ADR-005); the worker imports `app.domain`.
@@ -57,6 +67,9 @@ Everything runs in a virtualenv at `.venv` (Python 3.14). One-time: `.venv/bin/p
 -e ".[dev]"`.
 
 - **Tests:** `.venv/bin/python -m pytest`  ·  single test: `… -m pytest tests/eval/test_resolution_rate.py::TestPythonResolutionRate -q`
+- **Postgres tests:** set `ARGUS_TEST_DATABASE_URL`; they skip cleanly without it, so the
+  default run needs no database. `tests/pg.py` applies migrations once and truncates
+  between tests.
 - **Measured gates:** `… -m pytest tests/eval -s` prints the numbers (`-s` matters — the
   exit criteria are *reported*, not just asserted). The latency gate is marked `slow` and
   deselected by default: run it with `… -m pytest -m slow -s`.
@@ -123,6 +136,38 @@ The pipeline is layered strictly: **infra parses, domain reasons, the worker seq
   thing. An over-budget pack reports the overrun rather than hiding it.
 - **Every item carries a `reason`** ("calls app.store.save"). M7's retrieval inspector
   renders these; keep them populated when adding a retrieval path.
+- **Reads are scoped by repository *and* snapshot.** Repository scoping is tenancy;
+  snapshot scoping is correctness, because every index run re-creates the repository's
+  symbol rows and the union of all commits is not a codebase. `PostgresSymbolIndex`
+  binds to one snapshot at construction (`for_latest`), mirroring the in-memory adapter,
+  which is built from exactly one `SnapshotWrite`.
+- **The two adapter sets must stay interchangeable.** The eval harness runs on the fakes,
+  so any behaviour Postgres has that `InMemorySymbolIndex` lacks is a behaviour the gates
+  cannot see. `tests/infra/test_postgres_*.py` compare them method by method, and
+  `test_retrieval_pgvector.py` asserts both build byte-identical context packs. One known
+  and permanent difference: pgvector stores **float4**, so chunks that tie exactly in the
+  fake's float64 cosine get distinct distances and break ties differently. Assert on
+  members and scores-within-epsilon, never on tie order.
+
+## Postgres notes
+
+- **`chunks` are repository-scoped and outlive snapshots**; membership lives in
+  `snapshot_chunks`. This is why a chunk upsert never overwrites a stored vector with
+  NULL (`COALESCE(EXCLUDED.embedding, chunks.embedding)`) — an unembedded re-index must
+  not silently un-do the expensive half of indexing.
+- **A chunk that is already stored is not rewritten.** Chunks are immutable and
+  content-addressed, so `save()` writes only genuinely new chunks (plus any stored
+  without a vector that this run can supply one for) and gives everything else a
+  membership row. Rewriting all 29,000 on a one-file push is what put the incremental
+  gate over budget at 10.5 s before this landed.
+- **Bulk writes go through `COPY` into `ON COMMIT DROP` temp tables**, then one
+  `INSERT ... SELECT` per entity, so the path→file-id and fqn→symbol-id joins happen in
+  the server. Row counts are checked against the input (`_require_all_written`): a join
+  that silently drops rows is a smaller graph, which surfaces much later as a missing
+  review comment.
+- **Local Postgres for the gates:** `ARGUS_TEST_DATABASE_URL=postgresql://user@host/db`.
+  Unset, every Postgres test skips and the suite stays offline. Verified against
+  Postgres 18.4 + pgvector 0.8.6.
 
 ## The measured gates
 

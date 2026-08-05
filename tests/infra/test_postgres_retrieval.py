@@ -324,7 +324,10 @@ class TestScoping:
         await store.save(second)
 
         latest = await latest_ready_snapshot(pg_pool, corpus.repository_id)
-        assert latest == second.id
+        assert latest is not None
+        assert latest.id == second.id
+        assert latest.commit_sha == "3" * 40
+        assert latest.embedding_model == corpus.snapshot.embedding_model
 
         index = await PostgresSymbolIndex.for_latest(pg_pool, corpus.repository_id)
         assert index is not None
