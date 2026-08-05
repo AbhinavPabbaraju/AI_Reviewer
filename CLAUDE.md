@@ -17,9 +17,17 @@ of precision is usually the wrong trade here.
 
 ## Current state — read this first
 
-**M0 (contracts), M1 (ingestion + symbol graph) and M2 (embeddings + hybrid retrieval)
-are complete — every exit criterion is measured and green**, including retrieval p95
-against real pgvector (16 ms of an 800 ms budget). M3–M8 are untouched.
+**M0–M2 are complete** — every exit criterion measured and green, including retrieval p95
+against real pgvector (16 ms of an 800 ms budget). **M3 is half built: the verification
+gate is done and its exit criterion is green** (zero fabrications escape over 20 seeded
+PRs). M4–M8 are untouched.
+
+**What M3 still needs:** prompt templates with fenced untrusted-content blocks, constrained
+JSON decoding into `Finding` at temperature 0, prompt versioning, an `LLMPort` adapter, and
+the findings budget (top-N by `severity × confidence`). Dedup already landed — it is a
+gate. The gate consumes `Finding` objects, so none of that is required for it to work; the
+adversarial corpus in `tests/eval/corpus/seeded_prs.py` stands in for the model and becomes
+M6's recorded `LLMPort` payload.
 
 ```
 db/migrations/0001_init.sql          forward-only DDL (Postgres + pgvector)
@@ -30,6 +38,7 @@ services/api/app/domain/             pure: contracts, ports, and the algorithms
   indexing/  models.py ports.py filtering.py chunking.py incremental.py
              resolution.py embedding.py
   retrieval/ models.py ports.py expansion.py fusion.py retriever.py
+  review/    diff.py grouping.py verification.py ports.py
 services/api/app/infra/              adapters implementing the ports
   source/git_source.py               blobless bare clone → SourceProviderPort
   parsing/{python,typescript}.py     tree-sitter extractors → ParserPort
@@ -38,6 +47,9 @@ services/api/app/infra/              adapters implementing the ports
   store/{memory,postgres}.py         ParseCache + IndexStore + EmbeddingCache
   retrieval/{memory,postgres}.py     SymbolIndex + VectorStore
   db/{pool,migrate}.py               asyncpg pool + vector codec, migration runner
+  parsing/syntax.py                  tree-sitter SyntaxChecker → PATCH_PARSES
+  github/fake.py                     in-memory GitHubPort (M6 harness + gate tests)
+  review/head_files.py               HeadFilePort bound to one (repo, sha)
 services/api/app/api/                FastAPI: main.py deps.py schemas.py routers/
 services/api/app/config.py           env-driven Settings (ARGUS_ prefix)
 services/worker/worker/pipeline/indexer.py   the Stage I/II orchestrator
@@ -171,6 +183,37 @@ The pipeline is layered strictly: **infra parses, domain reasons, the worker seq
   Unset, every Postgres test skips and the suite stays offline. Verified against
   Postgres 18.4 + pgvector 0.8.6.
 
+## Stage V/VI (M3) — review and the verification gate
+
+- **The gate is a mechanism, not a prompt instruction.** Everything the model emits is a
+  *claim about a repository*, re-checked against that repository. `verification.py`
+  implements sec. 4.6's seven gates one method each.
+- **Hard gates reject; soft gates demote.** A finding citing a missing file is
+  unsalvageable. A finding whose *patch* fails still has prose worth posting, so the patch
+  is stripped and the prose survives. Conflating the two either posts fabrications or
+  discards real bugs over formatting.
+- **Demotion penalties are per gate, and that is load-bearing.** A flat 0.3 penalty made
+  "strip the patch, keep the prose" a fiction: one demotion pushed a typical finding under
+  its severity floor, so the prose was suppressed a step later. Penalties now match what
+  each failure says about *truth* — `SYMBOL_RESOLVES` 0.30 (the model invented part of its
+  reasoning), `PATCH_PARSES` 0.10 (the patch is wrong, the prose is not), `PATCH_APPLIES`
+  0.05 (says nothing about correctness, only about where GitHub can render it).
+- **Gate order matters.** Hard rejections short-circuit, so one root cause produces one
+  failure rather than four and the per-gate metrics stay meaningful. Dedup runs after
+  per-finding checks; `CONFIDENCE_FLOOR` runs last, because demotions lower confidence and
+  a twice-demoted finding must be measured after both.
+- **Dedup compares word sets, not characters.** Character similarity scores "Missing null
+  check on user lookup" / "Missing bounds check on index lookup" at 0.78 — higher than
+  genuine duplicates — because the differing words share letters. Jaccard over title tokens
+  separates them (0.50 vs 0.83). There is a regression test for exactly this.
+- **Changed lines are new-file numbers and deletions contribute none.** A deleted line does
+  not exist at head, so nothing can anchor to it. A finding in a file the diff never touched
+  is allowed *only* if it cites evidence in a changed file — "your new caller breaks this"
+  is a review comment; "this unrelated file has a bug" is noise the author cannot action.
+- **The review unit is a symbol, not a hunk.** Three hunks in one function are one change;
+  reviewing them separately asks the model the same question three times with less context
+  each time. Grouping uses the parsed symbol table, not git's `@@` heading guess.
+
 ## The measured gates
 
 Every milestone gate lives in `tests/eval/` and is *measured and printed*, not merely
@@ -184,6 +227,14 @@ asserted (run with `-s`):
   re-parsed and 29,000 chunks reused.
 - `test_retrieval_quality.py` (M2) runs 40 hand-built queries over the same corpora:
   the file a reviewer would need appears **95%** of the time against a ≥ 90% criterion.
+- `test_retrieval_pgvector.py` (M2) re-runs those queries against real Postgres: p95
+  **16 ms** of an 800 ms budget, identical recall, and byte-identical context packs.
+- `test_verification_gate.py` (M3) runs 20 seeded-defect PRs past an *adversarial* reviewer
+  that fabricates on purpose — one failure mode per gate. **Zero escapes** (the criterion is
+  a zero, not a low number), 70% drop rate, all seven gates exercised. Survivors are
+  re-derived from the head tree independently, so agreeing with the verifier is not enough;
+  and the legitimate finding seeded into each PR must survive in 20/20, because a gate that
+  suppresses everything would score a perfect zero and ship a product that never comments.
 
 **A gate that cannot fail measures nothing.** The retrieval gate runs at a deliberately
 tight 300-token budget, because at a production-sized budget these small corpora fit
