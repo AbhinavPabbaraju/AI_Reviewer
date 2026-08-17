@@ -102,11 +102,28 @@ webhook three times produces exactly one review and one set of comments.
 
 ## M6 — Evaluation harness  ⟵ *the milestone that makes this project worth building*
 
-- Corpus: mutation-seeded defects + reversed historical bug-fix commits, hand-labeled
-- Fake `GitHubPort` + recorded `LLMPort` so runs are deterministic and free
-- Metrics: precision, recall, FP rate, verification drop rate by gate, cost, latency
-- Confidence calibration (isotonic, per category) → replaces raw model scores
-- CI gate: block any prompt/model/retrieval change regressing precision > 2 pts
+- [x] Corpus: mutation-seeded defects, hand-labeled — **30 of the 120** (20 seeded,
+      10 clean). Reversed historical bug-fix commits are still to come.
+- [x] Fake `GitHubPort` + recorded `LLMPort` so runs are deterministic and free
+- [x] Metrics: precision, recall, FP rate, verification drop rate by gate, cost, latency
+- [ ] Confidence calibration (isotonic, per category) → replaces raw model scores
+- [ ] CI gate: block any prompt/model/retrieval change regressing precision > 2 pts
+
+**Partial exit, measured** (`tests/eval/test_eval_harness.py`, run with `-s`): 30 labeled
+cases; a full run in **0.9 s** of the 10 min budget at **$0.00**, byte-identical across
+runs; precision **0.842** and recall **0.750** against SLOs of 0.80 and 0.55; verification
+lifts precision **0.567 → 0.842** at zero recall cost. A deliberately worsened reviewer
+scores **0.327** — while the per-gate drop counts stay *identical*, which is the whole
+argument for labeling a corpus rather than watching the gate's own metrics.
+
+The harness paid for itself on its first run by finding two defects in Argus: a
+`SYMBOL_RESOLVES` vocabulary too narrow to include parameters and constants, which was
+demoting correct findings (**fixed** — `domain/review/vocabulary.py`), and a paraphrased
+duplicate that lexical dedup cannot catch (**pinned**, with the rejected fix written up).
+
+The two remaining boxes need the corpus at full size: an isotonic fit over 30 cases would
+be fitting noise, and a 2-point CI threshold is below this corpus's resolution (one comment
+either way moves precision by ~5 points).
 
 **Exit:** ≥ 120 labeled cases; a full eval run in < 10 min; the gate demonstrably
 catches a deliberately-worsened prompt.

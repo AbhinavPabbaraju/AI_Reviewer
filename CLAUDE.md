@@ -17,9 +17,18 @@ of precision is usually the wrong trade here.
 
 ## Current state — read this first
 
-**M0–M3 are complete** — every exit criterion measured and green, including retrieval p95
-against real pgvector (16 ms of an 800 ms budget) and zero fabrications escaping the
-verification gate over 20 seeded PRs. M4–M8 are untouched.
+**M0–M3 are complete, and M6 is done in part** — the eval harness and 30 labeled PRs,
+following the roadmap's own sequencing (M3 → **M6 partial** → M4). Every exit criterion is
+measured and green: retrieval p95 against real pgvector (16 ms of an 800 ms budget), zero
+fabrications escaping the verification gate over 20 seeded PRs, and a full 30-case eval run
+in **0.9 s of a 600 s budget at $0.00**. M4, M5, M7 and M8 are untouched, and so are M6's
+remaining two pieces — the isotonic calibration map and the CI regression gate.
+
+**The harness's first run found two real weaknesses in Argus, which is what it is for.**
+One is fixed (`SYMBOL_RESOLVES` was demoting correct findings for naming a parameter — see
+`domain/review/vocabulary.py`); one is pinned as a `TestKnownLimitations` test with the
+rejected fix written up, because the only honest fix is semantic. Read the M6 section before
+touching the verification gate.
 
 ## Argus runs for free
 
@@ -56,7 +65,7 @@ services/api/app/domain/             pure: contracts, ports, and the algorithms
   indexing/  models.py ports.py filtering.py chunking.py incremental.py
              resolution.py embedding.py
   retrieval/ models.py ports.py expansion.py fusion.py retriever.py
-  review/    diff.py grouping.py verification.py ports.py
+  review/    diff.py grouping.py verification.py ports.py vocabulary.py
              prompts.py decoding.py reviewer.py budget.py
 services/api/app/infra/              adapters implementing the ports
   source/git_source.py               blobless bare clone → SourceProviderPort
@@ -74,6 +83,9 @@ services/api/app/api/                FastAPI: main.py deps.py schemas.py routers
 services/api/app/config.py           env-driven Settings (ARGUS_ prefix)
 services/worker/worker/pipeline/indexer.py   the Stage I/II orchestrator
 tests/{domain,infra,worker,api,eval}/  unit tests + the measured milestone gates
+tests/eval/corpus/labeled_prs.py     M6 ground truth: 30 labeled PRs (20 seeded, 10 clean)
+tests/eval/harness/                  transcript.py (input) runner.py (pipeline)
+                                     metrics.py (scorer; imports no transcript)
 ```
 
 **What M2 still lacks:** a real network `EmbeddingPort` — only `DeterministicEmbedder`
@@ -208,6 +220,11 @@ The pipeline is layered strictly: **infra parses, domain reasons, the worker seq
 - **The gate is a mechanism, not a prompt instruction.** Everything the model emits is a
   *claim about a repository*, re-checked against that repository. `verification.py`
   implements sec. 4.6's seven gates one method each.
+- **`SYMBOL_RESOLVES` asks "could this model have known this name", not "does this name
+  exist".** Build its vocabulary with `vocabulary.build_vocabulary(symbols=…, packs=…)`:
+  the symbol table *and* the identifiers in the context pack the model was given. Passing
+  the symbol table alone is the narrow version M6 measured demoting correct findings, since
+  parameters, locals, fields and module constants are real code that is not in that table.
 - **Hard gates reject; soft gates demote.** A finding citing a missing file is
   unsalvageable. A finding whose *patch* fails still has prose worth posting, so the patch
   is stripped and the prose survives. Conflating the two either posts fabrications or
@@ -259,6 +276,66 @@ The pipeline is layered strictly: **infra parses, domain reasons, the worker seq
   severity, then confidence, then fingerprint, then id — because a tie broken by dict
   ordering would make the same run post different comments on different days.
 
+## M6 (partial) — the eval harness
+
+`tests/eval/harness/` runs whole pull requests through M1→M3 against a fake `GitHubPort`
+and a recorded `LLMPort`, and scores what was posted against hand-labeled ground truth in
+`tests/eval/corpus/labeled_prs.py` (30 PRs: 20 seeded defects, 10 clean).
+
+- **Three modules, split where it matters.** `transcript.py` is what the reviewer *says*
+  (the input), `runner.py` is the pipeline, `metrics.py` is the scorer. The scorer does not
+  import the transcript and must not: a scorer that could see what the reviewer intended
+  would be grading intent instead of output.
+- **Ten of the thirty PRs contain no defect.** Precision is the SLO, and a corpus of pure
+  defects cannot measure it — every comment would be arguably on target. The clean cases are
+  the changes a reviewer is *tempted* to comment on (a named local, a loop rewritten), so a
+  trigger-happy reviewer pays for it there and only there.
+- **The transcript is fixed, so any change in the numbers is a change in the pipeline.**
+  That is the same reason `RecordedLLM` exists, and it is what makes these metrics a
+  regression gate. The absolute values are a property of the transcript, so the enforced
+  floors sit deliberately below the published SLOs; the *delta* between stages is the number
+  that describes the code.
+- **Every metric is computed twice** — over what the model emitted and over what was posted.
+  Verification lifts precision **0.567 → 0.842** at **zero** recall cost. That gain is not a
+  property of the transcript, since both stages read the same one.
+- **Two precisions are reported, and the gap is the point.** `precision` is the SLO's own
+  metric — posted findings a human agrees with — so a duplicate of a true finding counts as
+  agreed with, because the author reads it and agrees. `precision_strict` charges it as
+  noise. Reporting only the strict number would hold the product to a bar stricter than its
+  own definition; reporting only the lenient one would hide what imperfect dedup costs.
+- **Matching is location overlap plus a label's `signals`.** Location alone would score a
+  confident wrong comment on the right line as a hit. The signal terms live in the label, in
+  the open, so a disputed case is arguable rather than buried in the scorer.
+- **`FILE_EXISTS` is unreachable from Stage V** and the harness asserts so: `decode_findings`
+  is handed the group's path as `allowed_paths`, so a cross-file claim is dropped at decode.
+  Only the M3 gate, which builds findings directly, can exercise it.
+
+**What the first run found.** Two real weaknesses, handled differently on purpose:
+
+1. **Fixed — `SYMBOL_RESOLVES` was punishing correct reviews.** It checked backticked tokens
+   against the symbol table alone, which holds modules, classes, functions and methods — not
+   parameters, locals, fields or module constants. Writing the way reviewers write ("slicing
+   to `limit`…") cost 0.30 confidence for quoting real code; four demotions in the corpus were
+   of that kind, and one left a true finding sitting exactly on its 0.60 floor.
+   `domain/review/vocabulary.py` now also harvests identifiers from the **context pack** —
+   the half of `known_symbols`'s own docstring that was never built. The pack is by
+   construction the code the model saw, so a name in it was read rather than invented, while
+   a name in neither the table nor the pack is still unaccounted for. Demotions went 6 → 2,
+   and the two survivors are exactly the fabricated helpers. Both ends are asserted: widening
+   a vocabulary until the gate cannot fire would be the obvious way to get this wrong.
+2. **Not fixed — a paraphrased duplicate escapes `NOT_DUPLICATE`.** Title word sets separate
+   two different bugs with similar titles (why dedup is not character similarity) but do not
+   catch one bug described twice in different words; `ts-04` scores 0.44 against a 0.70
+   threshold. **A lexical fix was tried and rejected**: stopwords plus stemming separate the
+   decisive pair 0.667 vs 0.429, but only with a stemmer special-cased to collapse *validated*
+   and *validation* — without that one hand-tuned rule both pairs score 0.429 and no threshold
+   exists. That is fitting a threshold to a single word pair, and the next paraphrase lands
+   somewhere else. Telling "same bug, different words" from "different bug, similar words" is
+   a semantic problem and wants a semantic tool. The cost is bounded and measured: one
+   redundant comment, which is the whole 0.842 → 0.789 gap between the two precisions. **Do
+   not "fix" this by lowering `duplicate_similarity`** — it breaks the documented
+   counterexample, and there is a regression test for exactly that.
+
 ## The measured gates
 
 Every milestone gate lives in `tests/eval/` and is *measured and printed*, not merely
@@ -280,6 +357,16 @@ asserted (run with `-s`):
   re-derived from the head tree independently, so agreeing with the verifier is not enough;
   and the legitimate finding seeded into each PR must survive in 20/20, because a gate that
   suppresses everything would score a perfect zero and ship a product that never comments.
+- `test_eval_harness.py` (M6 partial) runs all 30 labeled PRs end to end: **precision 0.842**
+  (SLO 0.80; strict 0.789), **recall 0.750** (SLO 0.55), 0.10 wrong comments per PR, 9/10
+  clean PRs silent, **$0.00** and **0.9 s** of a 600 s budget, byte-identical across runs.
+  Zero defects are lost to verification, and `recall_cost` is asserted to be exactly 0.
+
+**Sensitivity is the point of M6, and it is asserted.** A deliberately more speculative
+reviewer — one extra confident, unfalsifiable comment per PR — drops precision 0.842 → 0.327
+while the per-gate drop counts stay **byte-identical**. Every quality signal Argus had before
+M6 would have reported that regression as a clean run. That test is the argument for the
+labeled corpus; do not weaken it.
 
 **A gate that cannot fail measures nothing.** The retrieval gate runs at a deliberately
 tight 300-token budget, because at a production-sized budget these small corpora fit
