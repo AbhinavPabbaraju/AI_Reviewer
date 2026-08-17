@@ -41,13 +41,19 @@ dev = [
 # `app` (domain/infra/api) and `worker` (pipeline/tasks) are two top-level
 # packages living under separate service roots, installed as one distribution.
 # ADR-005: the worker shares `app.domain` as an installed local package.
+[project.scripts]
+# The CLI is the way a human uses Argus without a GitHub App: `argus review`
+# indexes a checkout, reviews the diff with a local model and prints what
+# survived verification. See services/cli/argus_cli/main.py.
+argus = "argus_cli.main:main"
+
 [tool.setuptools.packages.find]
-where = ["services/api", "services/worker"]
-include = ["app*", "worker*"]
+where = ["services/api", "services/worker", "services/cli"]
+include = ["app*", "worker*", "argus_cli*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["services/api", "services/worker"]
+pythonpath = ["services/api", "services/worker", "services/cli"]
 addopts = "-ra --strict-markers -m 'not slow'"
 asyncio_mode = "auto"
 markers = [
@@ -60,7 +66,7 @@ markers = [
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["services/api", "services/worker", "tests"]
+src = ["services/api", "services/worker", "services/cli", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PTH", "RUF"]
@@ -71,8 +77,8 @@ strict = true
 # The domain is the contract spine and is held to strict typing (M0/M1 exit
 # criteria). Infra adapters wrap untyped third-party libraries (tree-sitter),
 # so a couple of pragmatic escape hatches are configured per-module below.
-mypy_path = "services/api:services/worker"
-packages = ["app", "worker"]
+mypy_path = "services/api:services/worker:services/cli"
+packages = ["app", "worker", "argus_cli"]
 
 [[tool.mypy.overrides]]
 module = ["tree_sitter_python.*", "tree_sitter_typescript.*"]

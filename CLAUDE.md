@@ -17,8 +17,10 @@ of precision is usually the wrong trade here.
 
 ## Current state — read this first
 
-**M0–M3 are complete, and M6 is done in part** — the eval harness and 30 labeled PRs,
-following the roadmap's own sequencing (M3 → **M6 partial** → M4). Every exit criterion is
+**M0–M3 are complete, M6 is done in part, and there is a working CLI** — `argus review`
+runs the whole pipeline against a local checkout and a local model. M6 partial (the eval
+harness and 30 labeled PRs) follows the roadmap's own sequencing (M3 → **M6 partial** → M4).
+Every exit criterion is
 measured and green: retrieval p95 against real pgvector (16 ms of an 800 ms budget), zero
 fabrications escaping the verification gate over 20 seeded PRs, and a full 30-case eval run
 in **0.9 s of a 600 s budget at $0.00**. M4, M5, M7 and M8 are untouched, and so are M6's
@@ -29,6 +31,36 @@ One is fixed (`SYMBOL_RESOLVES` was demoting correct findings for naming a param
 `domain/review/vocabulary.py`); one is pinned as a `TestKnownLimitations` test with the
 rejected fix written up, because the only honest fix is semantic. Read the M6 section before
 touching the verification gate.
+
+## How a human runs it
+
+`argus review` (`services/cli/argus_cli/`) is the way Argus is used without a GitHub App:
+index the checkout, diff it, review with a local Ollama model, verify, print what survived.
+`argus doctor` checks git/Ollama/model before a wait is spent. Both are covered by
+`tests/cli/`, including four tests against a stub HTTP server that speaks Ollama's protocol —
+the CLI's provider call, decode, gate and exit code are all real in those.
+
+- **The CLI is a shell over `worker/pipeline/review.py`, not glue.** That orchestrator is the
+  Stage III/V/VI sibling of `indexer.py`, and it exists because three consumers need the same
+  sequence: the CLI, the M6 harness, and M5's GitHub App. Sequencing that lives in one of
+  them is sequencing the other two are not testing. **Put pipeline changes there, not in the
+  CLI.**
+- **`prepare` / `execute` are split deliberately.** Everything before the first model token
+  is free, and the interesting things a caller does between the phases all need the plan:
+  show the user what is about to be reviewed, record a cassette against the exact prompts,
+  refuse a diff too large to afford.
+- **There is no flag that skips verification, and there must never be one.** A caller that
+  could skip the gate is a caller that can post fabrications.
+- **The CLI indexes the working tree, not `HEAD`** (`infra/source/working_tree.py`). If the
+  index came from `HEAD` while the diff described uncommitted edits, every line number would
+  be off by whatever you just wrote and correct findings would be rejected for citing lines
+  that "do not exist". Blob shas for dirty files are recomputed with git's own blob hash —
+  reusing the committed sha would hit the parse cache against the wrong content.
+- **It must never touch the user's checkout.** `--pr` fetches `refs/pull/N/head` into a
+  throwaway worktree (no API token needed for a public repo) and removes it after. A review
+  tool that moved your HEAD is one you stop running.
+- **Render to a stream resolved at call time,** never `out=sys.stdout` as a default argument
+  — that binds at import and silently ignores any redirection.
 
 ## Argus runs for free
 
@@ -69,6 +101,7 @@ services/api/app/domain/             pure: contracts, ports, and the algorithms
              prompts.py decoding.py reviewer.py budget.py
 services/api/app/infra/              adapters implementing the ports
   source/git_source.py               blobless bare clone → SourceProviderPort
+  source/working_tree.py             a checkout on disk, uncommitted edits included
   parsing/{python,typescript}.py     tree-sitter extractors → ParserPort
   parsing/registry.py  base.py       language→parser map + tree-sitter plumbing
   embedding/deterministic.py         offline hashing embedder → EmbeddingPort
@@ -82,7 +115,9 @@ services/api/app/infra/              adapters implementing the ports
 services/api/app/api/                FastAPI: main.py deps.py schemas.py routers/
 services/api/app/config.py           env-driven Settings (ARGUS_ prefix)
 services/worker/worker/pipeline/indexer.py   the Stage I/II orchestrator
-tests/{domain,infra,worker,api,eval}/  unit tests + the measured milestone gates
+services/worker/worker/pipeline/review.py    the Stage III/V/VI orchestrator
+services/cli/argus_cli/              the `argus` command: main.py repo.py render.py
+tests/{domain,infra,worker,api,cli,eval}/  unit tests + the measured milestone gates
 tests/eval/corpus/labeled_prs.py     M6 ground truth: 30 labeled PRs (20 seeded, 10 clean)
 tests/eval/harness/                  transcript.py (input) runner.py (pipeline)
                                      metrics.py (scorer; imports no transcript)
